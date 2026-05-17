@@ -1,0 +1,20 @@
+[project]
+name = "search-agent"
+version = "0.1.0"
+description = "多轮对话深度研究 Agent — Viking L0/L1/L2 渐进压缩链"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.1.8",
+    "langchain-core>=1.3.0",
+    "fastapi>=0.135.2",
+    "uvicorn[standard]>=0.42.0",
+    "sse-starlette>=3.4.2",
+    "psycopg2-binary>=2.9.11",
+    "httpx>=0.28.1",
+    "trafilatura>=2.0.0",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.13.1",
+    "duckduckgo_search>=8.1.1",
+    "sentence-transformers>=5.4.1",
+    "torch>=2.8.0",
+]

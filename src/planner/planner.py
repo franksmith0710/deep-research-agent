@@ -1,0 +1,67 @@
+"""规划器：指代消解 + 子问题分解 + 澄清 + 搜索规划。"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from src.llm.client import chat_json
+
+_RESOLVE_PROMPT = """你是一个调研规划助手。用户在一个多轮对话中提出新问题，你需要：
+1. 消解指代："市场规模方面再说详细点" → "2025 国内 AI Agent 市场规模数据补充"
+2. 保持原意，不添加未提及的内容
+3. 返回 resolved_query（消解后的查询）
+
+当前已有报告摘要：{l0_summary}
+用户问题：{query}
+
+返回 JSON：{{"resolved_query": "..."}}
+"""
+
+_CLARIFY_PROMPT = """你需要判断用户的查询是否需要补充范围。如果用户的问题模糊或过于宽泛，
+请返回建议的调研维度（最多 4 个）。否则返回空数组。
+
+用户查询：{resolved_query}
+
+返回 JSON：{{"need_scope": true/false, "suggested_dimensions": ["维度1", "维度2", ...]}}
+"""
+
+_PLAN_PROMPT = """你是一个搜索规划专家。基于用户的调研需求，生成 3-5 个子搜索查询，
+覆盖不同维度，便于搜索引擎获取全面信息。
+
+调研需求：{resolved_query}
+
+返回 JSON：{{"sub_queries": ["查询1", "查询2", "查询3", ...]}}
+"""
+
+
+def resolve_query(query: str, l0_summary: str = "") -> str:
+    """指代消解：将多轮对话中的指代转换为独立查询。"""
+    result = chat_json([
+        {"role": "system", "content": "你是调研助手，负责消解指代。请用 JSON 格式回答。"},
+        {"role": "user", "content": _RESOLVE_PROMPT.format(
+            l0_summary=l0_summary[:500], query=query
+        )},
+    ])
+    return result.get("resolved_query", query)
+
+
+def need_clarification(resolved_query: str) -> dict[str, Any]:
+    """判断是否需要用户补充范围。返回 {need_scope, suggested_dimensions}。"""
+    result = chat_json([
+        {"role": "system", "content": "你是调研助手，负责判断是否需要澄清范围。请用 JSON 格式回答。"},
+        {"role": "user", "content": _CLARIFY_PROMPT.format(resolved_query=resolved_query)},
+    ])
+    return {
+        "need_scope": result.get("need_scope", False),
+        "suggested_dimensions": result.get("suggested_dimensions", []),
+    }
+
+
+def generate_sub_queries(resolved_query: str) -> list[str]:
+    """生成子搜索查询。"""
+    result = chat_json([
+        {"role": "system", "content": "你是搜索规划专家。请用 JSON 格式回答。"},
+        {"role": "user", "content": _PLAN_PROMPT.format(resolved_query=resolved_query)},
+    ])
+    return result.get("sub_queries", [resolved_query])
