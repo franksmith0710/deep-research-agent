@@ -1,6 +1,6 @@
 -- Deep Research Agent 数据库初始化脚本
--- 无 Redis + 无 Chroma + 无 pgvector 轻量化设计
--- 嵌入存 DOUBLE PRECISION[]，余弦相似度在 Python 中计算
+-- 无 Redis + 无 Chroma 轻量化设计
+-- 嵌入存 vector(1024) + HNSW 索引（pgvector）
 -- chat_history（对话展示）
 -- research_tasks（任务 + 报告 + L0）
 -- source_credibility（来源信誉）
@@ -65,6 +65,8 @@ CREATE INDEX IF NOT EXISTS idx_credibility_score ON source_credibility(score DES
 -- Viking L1 + L2 统一存储
 -- 嵌入用 vector(1024) 类型 + HNSW 索引（pgvector 0.5+）
 -- ============================================================
+
+CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS memory_store (
     id          SERIAL PRIMARY KEY,
