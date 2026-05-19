@@ -8,6 +8,13 @@ from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
 
+def _merge_sections(
+    old: dict[str, str], new: dict[str, str]
+) -> dict[str, str]:
+    """sections dict 合并 reducer：新章节覆盖旧章节，旧章节保留。"""
+    return {**old, **new}
+
+
 class AgentState(TypedDict):
     """LangGraph Agent 全局状态。"""
     
@@ -37,7 +44,7 @@ class AgentState(TypedDict):
     
     # 报告
     report: str
-    sections: dict[str, str]  # 章节名→内容，用于 patch
+    sections: Annotated[dict[str, str], _merge_sections]  # 章节名→内容，用于 patch
     
     # 控制
     deep_search_count: int

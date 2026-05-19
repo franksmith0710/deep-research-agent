@@ -6,6 +6,9 @@ import json
 from typing import Any
 
 from src.llm.client import chat_json
+from src.logging_config import get_logger
+
+logger = get_logger("synthesize")
 
 _SYNTHESIZE_PROMPT = """你是一个研究综合专家。根据以下发现列表，
 按主题维度生成综合内容（新搜索话题的章节内容）。
@@ -35,6 +38,7 @@ def synthesize_section(
     topic: str,
 ) -> dict[str, Any]:
     """综合多个 L1 发现生成一个章节。findings 中应包含 topic, content, source_url。"""
+    logger.debug(f"synthesize_section topic='{topic}' findings={len(findings)}")
     lines = []
     for i, f in enumerate(findings, 1):
         lines.append(f"[{i}] topic={f.get('topic', '')} | source={f.get('source_url', '')}")

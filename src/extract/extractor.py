@@ -6,6 +6,9 @@ import json
 from typing import Any
 
 from src.llm.client import chat_json
+from src.logging_config import get_logger
+
+logger = get_logger("extract")
 
 _EXTRACT_PROMPT = """你是一个信息提取专家。从以下网页内容中提取核心发现。
 
@@ -33,7 +36,7 @@ _EXTRACT_PROMPT = """你是一个信息提取专家。从以下网页内容中�
 
 def extract_from_content(title: str, content: str) -> dict[str, Any]:
     """从 L2 网页内容中提取 L0 摘要和 L1 发现列表。"""
-    # 限制输入长度（约 6000 token）
+    logger.debug(f"extract_from_content title='{title[:50]}...'")
     max_chars = 15000
     truncated = content[:max_chars]
     if len(content) > max_chars:

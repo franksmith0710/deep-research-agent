@@ -20,7 +20,7 @@ export interface PatchEvent {
 }
 
 export interface HITLEvent {
-  mode: 'scope_select' | 'conflict_resolve' | 'outline_edit'
+  mode: 'scope_select' | 'conflict_resolve' | 'outline_edit' | 'direction_adjust'
   session_id: string
   options: Record<string, unknown>
   ts: string

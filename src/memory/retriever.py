@@ -10,12 +10,18 @@ from src.db.postgres import (
     get_memories_by_task,
 )
 from src.local_models.embedder import embed_query
+from src.logging_config import get_logger
+
+logger = get_logger("memory")
 
 
 def retrieve_l1(query: str, limit: int = 5, min_score: float = 0.7) -> list[dict[str, Any]]:
     """L1 语义检索：embedding 余弦相似度。"""
+    logger.debug(f"L1 retrieval query='{query[:50]}...' limit={limit}")
     embedding = embed_query(query)
-    return search_memory_by_vector(embedding, limit=limit, min_score=min_score)
+    results = search_memory_by_vector(embedding, limit=limit, min_score=min_score)
+    logger.debug(f"L1 retrieval returned {len(results)} results")
+    return results
 
 
 def retrieve_l2(source_url: str) -> list[dict[str, Any]]:

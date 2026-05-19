@@ -1,18 +1,47 @@
 <script setup lang="ts">
+import { watch, ref, nextTick } from 'vue'
+import { marked } from 'marked'
 import { useChatStore } from '../stores/chatStore'
-import ThoughtBlock from './ThoughtBlock.vue'
 
 const chatStore = useChatStore()
+const container = ref<HTMLElement>()
+
+function render(md: string) {
+  return marked.parse(md || '') as string
+}
+
+watch([() => chatStore.messages.length, () => chatStore.streamingText, () => chatStore.chainEvents.length], async () => {
+  await nextTick()
+  if (container.value) {
+    container.value.scrollTop = container.value.scrollHeight
+  }
+}, { flush: 'post' })
 </script>
 
 <template>
-  <div class="chat-history">
+  <div ref="container" class="chat-history">
     <div v-for="msg in chatStore.messages" :key="msg.id" class="message" :class="msg.role">
-      <div class="bubble">{{ msg.content }}</div>
+      <div v-if="msg.role === 'assistant'" class="bubble" v-html="render(msg.content)"></div>
+      <div v-else class="bubble">{{ msg.content }}</div>
     </div>
-    <div v-for="(ev, i) in chatStore.chainEvents" :key="i">
-      <ThoughtBlock :event="ev" />
+
+    <div v-if="chatStore.chainEvents.length > 0 && !chatStore.isStreaming" class="thinking-steps">
+      <div
+        v-for="(ev, i) in chatStore.chainEvents"
+        :key="i"
+        class="thinking-step"
+        :class="{ latest: i === chatStore.chainEvents.length - 1 }"
+      >
+        <span class="step-dot"></span>
+        <span class="step-text">{{ ev.content }}</span>
+      </div>
     </div>
+
+    <div v-if="chatStore.isStreaming" class="message assistant">
+      <div class="bubble streaming" v-html="render(chatStore.streamingText)"></div>
+    </div>
+
+    <div v-if="chatStore.isStreaming" class="streaming-cursor"></div>
   </div>
 </template>
 
@@ -25,20 +54,75 @@ const chatStore = useChatStore()
 .message { margin-bottom: 12px; }
 .message.user { text-align: right; }
 .message.user .bubble {
-  background: #0f3460;
+  background: #1976d2;
   color: white;
   display: inline-block;
   padding: 10px 16px;
   border-radius: 16px 16px 4px 16px;
-  max-width: 70%;
+  max-width: 80%;
   text-align: left;
 }
 .message.assistant .bubble {
-  background: #1a1a2e;
-  color: #e0e0e0;
+  background: #f0f0f4;
+  color: #1a1a1a;
+  display: block;
+  padding: 12px 16px;
+  border-radius: 12px;
+  max-width: 100%;
+  line-height: 1.7;
+  font-size: 14px;
+  border: 1px solid #e0e0e0;
+}
+.message.assistant .bubble :deep(h1) { font-size: 18px; margin: 12px 0 6px; color: #1a1a1a; }
+.message.assistant .bubble :deep(h2) { font-size: 16px; margin: 10px 0 4px; color: #1976d2; }
+.message.assistant .bubble :deep(p) { margin: 6px 0; }
+.message.assistant .bubble :deep(ul) { padding-left: 20px; }
+.message.assistant .bubble :deep(a) { color: #1976d2; text-decoration: none; }
+
+.thinking-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 0;
+  font-size: 14px;
+  color: #666;
+}
+.thinking-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  line-height: 1.4;
+}
+.step-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #bbb;
+  flex-shrink: 0;
+}
+.thinking-step.latest .step-dot {
+  background: #1976d2;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+.thinking-step.latest .step-text {
+  color: #1976d2;
+  font-weight: 500;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.9); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+
+.streaming-cursor {
   display: inline-block;
-  padding: 10px 16px;
-  border-radius: 16px 16px 16px 4px;
-  max-width: 70%;
+  width: 8px;
+  height: 16px;
+  background: #1976d2;
+  margin-left: 8px;
+  animation: blink 0.8s step-end infinite;
+  vertical-align: middle;
+}
+@keyframes blink {
+  50% { opacity: 0; }
 }
 </style>

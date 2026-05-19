@@ -5,11 +5,15 @@ from __future__ import annotations
 from urllib.parse import urlparse
 
 from src.db.postgres import upsert_credibility, get_credibility
+from src.logging_config import get_logger
+
+logger = get_logger("credibility")
 
 
 def update_source_credibility(url: str, success: bool) -> None:
     """更新来源信誉分。"""
     domain = urlparse(url).netloc
+    logger.debug(f"credibility update url={url} domain={domain} success={success}")
     upsert_credibility(url, domain, success)
 
 

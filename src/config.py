@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     bge_embedder_path: str = "D:/hf_models/BAAI/bge-m3"
     bge_reranker_path: str = "D:/hf_models/BAAI/bge-reranker-v2-m3"
 
+    memory_retrieval_limit: int = 3
+    memory_min_score: float = 0.7
+
+    log_level: str = "DEBUG"
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 

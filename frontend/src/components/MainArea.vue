@@ -1,45 +1,48 @@
 <script setup lang="ts">
-import { onMounted, watch } from 'vue'
+import { watch, ref } from 'vue'
 import { useSessionStore } from '../stores/sessionStore'
 import { useChatStore } from '../stores/chatStore'
-import { useReportStore } from '../stores/reportStore'
 import { fetchHistory } from '../api'
 import ChatHistory from './ChatHistory.vue'
-import ReportBlock from './ReportBlock.vue'
 import QueryInput from './QueryInput.vue'
 import type { useHITL } from '../composables/useHITL'
 
 const props = defineProps<{ hitl: ReturnType<typeof useHITL> }>()
 const sessionStore = useSessionStore()
 const chatStore = useChatStore()
-const reportStore = useReportStore()
+const queryInputRef = ref<{ abort: () => void }>()
 
-watch(() => sessionStore.currentSessionId, async (id) => {
+function loadReport(report: string | null) {
+  if (!report) return
+  const exists = chatStore.messages.some(
+    m => m.role === 'assistant' && m.content === report
+  )
+  if (!exists) {
+    chatStore.addMessage({
+      id: Date.now(),
+      role: 'assistant',
+      content: report,
+      created_at: new Date().toISOString(),
+    })
+  }
+}
+
+watch(() => sessionStore.currentSessionId, async (id, oldId) => {
   if (!id) return
+  if (oldId) queryInputRef.value?.abort()
   chatStore.reset()
-  reportStore.reset()
   try {
     const data = await fetchHistory(id)
     chatStore.setMessages(data.messages || [])
-    if (data.report) reportStore.setReport(data.report)
+    loadReport(data.report)
   } catch { /* ignore */ }
-})
-
-onMounted(() => {
-  if (sessionStore.currentSessionId) {
-    fetchHistory(sessionStore.currentSessionId).then(data => {
-      chatStore.setMessages(data.messages || [])
-      if (data.report) reportStore.setReport(data.report)
-    })
-  }
 })
 </script>
 
 <template>
   <main class="main-area">
     <ChatHistory />
-    <ReportBlock :report="reportStore.report.content" />
-    <QueryInput />
+    <QueryInput ref="queryInputRef" :hitl="hitl" />
   </main>
 </template>
 
@@ -48,7 +51,7 @@ onMounted(() => {
   flex: 1;
   display: flex;
   flex-direction: column;
-  background: #0a0a1a;
+  background: #ffffff;
   color: #e0e0e0;
   overflow: hidden;
 }

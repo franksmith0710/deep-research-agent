@@ -8,7 +8,12 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 
+from pgvector.psycopg2 import register_vector
+
 from src.config import settings
+from src.logging_config import get_logger
+
+logger = get_logger("db")
 
 # 全局连接池
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
@@ -16,10 +21,12 @@ _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
 def init_pool(minconn: int = 2, maxconn: int = 8) -> None:
     global _pool
+    logger.info(f"PostgreSQL pool initializing dsn={settings.postgres_dsn.split('@')[1] if '@' in settings.postgres_dsn else 'unknown'}")
     _pool = psycopg2.pool.ThreadedConnectionPool(
         minconn, maxconn, settings.postgres_dsn,
         client_encoding='utf8'
     )
+    logger.info("PostgreSQL pool initialized")
 
 
 def close_pool() -> None:
@@ -27,6 +34,7 @@ def close_pool() -> None:
     if _pool:
         _pool.closeall()
         _pool = None
+        logger.info("PostgreSQL pool closed")
 
 
 @asynccontextmanager
@@ -135,6 +143,39 @@ def update_task(task_id: int, **fields: Any) -> None:
             _pool.putconn(conn)
 
 
+def load_task_context(session_id: str) -> dict[str, Any] | None:
+    """加载会话最近的 task 上下文（report/sections/outline/deep_search_count）。
+
+    sections 从 report 内容中按 h2 标题正则解析，而非从空的 outline 重建。
+    """
+    import re
+    task = get_task_by_session(session_id)
+    if not task:
+        return None
+    sections: dict[str, str] = {}
+    report_text = task.get("report") or ""
+    if report_text:
+        parts = re.split(r"(?=^##\s+)", report_text, flags=re.MULTILINE)
+        for part in parts:
+            m = re.match(r"^##\s+(.+?)\s*$", part, re.MULTILINE)
+            if m:
+                title = m.group(1).strip()
+                content = part[m.end():].strip()
+                sections[title] = content
+    if not sections and task.get("outline") and isinstance(task["outline"], list):
+        for ch in task["outline"]:
+            sec = ch.get("section", "") if isinstance(ch, dict) else str(ch)
+            sections[sec] = ""
+    return {
+        "task_id": task["task_id"],
+        "report": report_text,
+        "sections": sections,
+        "outline": task.get("outline", []) or [],
+        "deep_search_count": task.get("deep_search_count", 0),
+        "l0_summary": task.get("l0_summary", "") or "",
+    }
+
+
 def get_all_sessions() -> list[dict[str, Any]]:
     with _pool.getconn() as conn:
         try:
@@ -153,6 +194,37 @@ def get_all_sessions() -> list[dict[str, Any]]:
             _pool.putconn(conn)
 
 
+def delete_session_data(session_id: str) -> None:
+    with _pool.getconn() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT task_id FROM research_tasks WHERE session_id = %s",
+                    (session_id,),
+                )
+                task_ids = [row[0] for row in cur.fetchall()]
+            if task_ids:
+                placeholders = ",".join(["%s"] * len(task_ids))
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"DELETE FROM memory_store WHERE task_id IN ({placeholders})",
+                        tuple(task_ids),
+                    )
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM chat_history WHERE session_id = %s",
+                    (session_id,),
+                )
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM research_tasks WHERE session_id = %s",
+                    (session_id,),
+                )
+            conn.commit()
+        finally:
+            _pool.putconn(conn)
+
+
 # ── memory_store ──────────────────────────────────────────────────────
 
 def insert_memory(
@@ -164,6 +236,7 @@ def insert_memory(
     embedding: list[float] | None = None,
 ) -> int:
     with _pool.getconn() as conn:
+        register_vector(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -191,72 +264,55 @@ def update_memory(id: int, content: str) -> None:
             _pool.putconn(conn)
 
 
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    import math
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(x * x for x in b))
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
-
-
 def search_memory_by_vector(
     query_embedding: list[float], limit: int = 5, min_score: float = 0.7
 ) -> list[dict[str, Any]]:
-    """内存计算余弦相似度，替代 pgvector <=> 操作符"""
+    """pgvector HNSW 余弦相似度搜索"""
     with _pool.getconn() as conn:
+        register_vector(conn)
         try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT id, task_id, content, source_url, topic, embedding
-                       FROM memory_store
-                       WHERE level = 'L1' AND embedding IS NOT NULL"""
+                    """WITH scored AS (
+                           SELECT id, task_id, content, source_url, topic,
+                                  1 - (embedding <=> %s::vector) AS similarity
+                           FROM memory_store
+                           WHERE level = 'L1' AND embedding IS NOT NULL
+                       )
+                       SELECT * FROM scored
+                       WHERE similarity >= %s
+                       ORDER BY similarity DESC
+                       LIMIT %s""",
+                    (query_embedding, min_score, limit),
                 )
-                rows = cur.fetchall()
+                return _dict_rows(cur)
         finally:
             _pool.putconn(conn)
-
-    scored = []
-    for row in rows:
-        emb = row.get("embedding")
-        if emb is None:
-            continue
-        sim = _cosine_similarity(query_embedding, emb)
-        if sim >= min_score:
-            row["similarity"] = round(sim, 4)
-            scored.append(row)
-    scored.sort(key=lambda r: r["similarity"], reverse=True)
-    return scored[:limit]
 
 
 def search_memory_by_topic(
     query_embedding: list[float], topic: str, limit: int = 2
 ) -> list[dict[str, Any]]:
-    """按 topic 精确过滤 + 内存重排序"""
+    """按 topic 精确过滤 + pgvector 余弦相似度排序"""
     with _pool.getconn() as conn:
+        register_vector(conn)
         try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT id, task_id, content, source_url, topic, embedding
-                       FROM memory_store
-                       WHERE level = 'L1' AND topic = %s AND embedding IS NOT NULL""",
-                    (topic,),
+                    """WITH scored AS (
+                           SELECT id, task_id, content, source_url, topic,
+                                  1 - (embedding <=> %s::vector) AS similarity
+                           FROM memory_store
+                           WHERE level = 'L1' AND topic = %s AND embedding IS NOT NULL
+                       )
+                       SELECT * FROM scored
+                       ORDER BY similarity DESC
+                       LIMIT %s""",
+                    (query_embedding, topic, limit),
                 )
-                rows = cur.fetchall()
+                return _dict_rows(cur)
         finally:
             _pool.putconn(conn)
-
-    scored = []
-    for row in rows:
-        emb = row.get("embedding")
-        if emb is None:
-            continue
-        sim = _cosine_similarity(query_embedding, emb)
-        row["similarity"] = round(sim, 4)
-        scored.append(row)
-    scored.sort(key=lambda r: r["similarity"], reverse=True)
-    return scored[:limit]
 
 
 def get_l2_by_url(source_url: str) -> list[dict[str, Any]]:

@@ -6,9 +6,12 @@ import json
 from typing import Any
 
 from src.llm.client import chat_json
+from src.logging_config import get_logger
+
+logger = get_logger("planner")
 
 _RESOLVE_PROMPT = """你是一个调研规划助手。用户在一个多轮对话中提出新问题，你需要：
-1. 消解指代："市场规模方面再说详细点" → "2025 国内 AI Agent 市场规模数据补充"
+1. 消解指代："刚才说的那个方面再详细讲讲" → "固态电池量产进展再详细讲讲"
 2. 保持原意，不添加未提及的内容
 3. 返回 resolved_query（消解后的查询）
 
@@ -37,13 +40,16 @@ _PLAN_PROMPT = """你是一个搜索规划专家。基于用户的调研需求�
 
 def resolve_query(query: str, l0_summary: str = "") -> str:
     """指代消解：将多轮对话中的指代转换为独立查询。"""
+    logger.debug(f"resolve_query: '{query}' l0_summary={len(l0_summary)}")
     result = chat_json([
         {"role": "system", "content": "你是调研助手，负责消解指代。请用 JSON 格式回答。"},
         {"role": "user", "content": _RESOLVE_PROMPT.format(
             l0_summary=l0_summary[:500], query=query
         )},
     ])
-    return result.get("resolved_query", query)
+    resolved = result.get("resolved_query", query)
+    logger.debug(f"resolve_query result: '{resolved}'")
+    return resolved
 
 
 def need_clarification(resolved_query: str) -> dict[str, Any]:
@@ -52,9 +58,12 @@ def need_clarification(resolved_query: str) -> dict[str, Any]:
         {"role": "system", "content": "你是调研助手，负责判断是否需要澄清范围。请用 JSON 格式回答。"},
         {"role": "user", "content": _CLARIFY_PROMPT.format(resolved_query=resolved_query)},
     ])
+    need_scope = result.get("need_scope", False)
+    dims = result.get("suggested_dimensions", [])
+    logger.debug(f"need_clarification need_scope={need_scope} dims={dims}")
     return {
-        "need_scope": result.get("need_scope", False),
-        "suggested_dimensions": result.get("suggested_dimensions", []),
+        "need_scope": need_scope,
+        "suggested_dimensions": dims,
     }
 
 
@@ -64,4 +73,6 @@ def generate_sub_queries(resolved_query: str) -> list[str]:
         {"role": "system", "content": "你是搜索规划专家。请用 JSON 格式回答。"},
         {"role": "user", "content": _PLAN_PROMPT.format(resolved_query=resolved_query)},
     ])
-    return result.get("sub_queries", [resolved_query])
+    sub_queries = result.get("sub_queries", [resolved_query])
+    logger.debug(f"generate_sub_queries: {sub_queries}")
+    return sub_queries

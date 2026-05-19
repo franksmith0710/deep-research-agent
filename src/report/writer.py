@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, AsyncGenerator, Callable
 
-from src.llm.client import chat_json
+from src.llm.client import chat_json, chat_stream
+from src.logging_config import get_logger
+
+logger = get_logger("report")
 
 _OUTLINE_PROMPT = """你是一个报告架构师。为以下调研主题规划 7 章标准报告大纲。
 
@@ -53,6 +56,7 @@ _REPORT_PROMPT = """你是一个专业报告写手。基于以下调研发现，
 
 def generate_outline(query: str) -> list[dict[str, Any]]:
     """生成 7 章报告大纲。"""
+    logger.debug(f"generate_outline query='{query[:50]}...'")
     result = chat_json([
         {"role": "system", "content": "你是报告架构师。请用 JSON 格式回答。"},
         {"role": "user", "content": _OUTLINE_PROMPT.format(query=query)},
@@ -62,6 +66,7 @@ def generate_outline(query: str) -> list[dict[str, Any]]:
 
 def generate_report(query: str, outline: list[dict], findings: list[dict]) -> dict[str, Any]:
     """基于大纲和发现生成完整报告。"""
+    logger.debug(f"generate_report query='{query[:50]}...' outline={len(outline)} findings={len(findings)}")
     outline_lines = []
     for o in outline:
         outline_lines.append(f"## {o.get('section', '')}")
@@ -81,6 +86,53 @@ def generate_report(query: str, outline: list[dict], findings: list[dict]) -> di
             outline_text=outline_text, findings_text=findings_text
         )},
     ])
+
+    return {
+        "report": result.get("report", ""),
+        "sections": result.get("sections", {}),
+    }
+
+
+async def generate_report_stream(
+    query: str,
+    outline: list[dict],
+    findings: list[dict],
+    on_token: Callable[[str], Any] | None = None,
+) -> dict[str, Any]:
+    """流式生成报告，边生成边输出 token。"""
+    logger.debug(f"generate_report_stream query='{query[:50]}...' outline={len(outline)} findings={len(findings)}")
+
+    outline_lines = []
+    for o in outline:
+        outline_lines.append(f"## {o.get('section', '')}")
+        for p in o.get("points", []):
+            outline_lines.append(f"  - {p}")
+    outline_text = "\n".join(outline_lines)
+
+    findings_lines = []
+    for i, f in enumerate(findings, 1):
+        findings_lines.append(f"[{i}] topic={f.get('topic', '')} | source={f.get('source_url', '')}")
+        findings_lines.append(f"    {f.get('content', '')}")
+    findings_text = "\n".join(findings_lines)
+
+    messages = [
+        {"role": "system", "content": "你是专业报告写手。请用 JSON 格式回答。"},
+        {"role": "user", "content": _REPORT_PROMPT.format(
+            outline_text=outline_text, findings_text=findings_text
+        )},
+    ]
+
+    full_content = ""
+    async for token in chat_stream(messages):
+        full_content += token
+        if on_token:
+            await on_token(token)
+
+    try:
+        result = json.loads(full_content)
+    except json.JSONDecodeError as e:
+        logger.warning(f"Streaming result parse JSON failed, treating as raw: {e}")
+        result = {"report": full_content, "sections": {}}
 
     return {
         "report": result.get("report", ""),

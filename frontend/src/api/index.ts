@@ -14,6 +14,10 @@ export async function createSession(): Promise<string> {
   return data.session_id
 }
 
+export async function deleteSession(sessionId: string): Promise<void> {
+  await fetch(`${BASE}/sessions/${sessionId}`, { method: 'DELETE' })
+}
+
 export async function fetchHistory(sessionId: string): Promise<{
   messages: ChatMessage[]
   report: string | null
@@ -22,27 +26,30 @@ export async function fetchHistory(sessionId: string): Promise<{
   return res.json()
 }
 
+interface SSEAbortable {
+  abort: () => void
+}
+
 export function researchSSE(
   query: string,
   sessionId: string,
   onEvent: (event: string, data: string) => void,
   onError: (err: string) => void,
   onDone: () => void,
-): EventSource {
+): SSEAbortable {
   const xhr = new XMLHttpRequest()
   xhr.open('POST', `${BASE}/research`)
   xhr.setRequestHeader('Content-Type', 'application/json')
   xhr.responseType = 'text'
 
-  let lastIndex = 0
+  let buffer = ''
 
   xhr.onprogress = () => {
-    const newData = xhr.responseText.slice(lastIndex)
-    lastIndex = xhr.responseText.length
-
-    const lines = newData.split('\n')
+    buffer += xhr.responseText.slice(buffer.length)
+    const parts = buffer.split('\n')
+    buffer = parts.pop() || ''
     let currentEvent = ''
-    for (const line of lines) {
+    for (const line of parts) {
       if (line.startsWith('event: ')) {
         currentEvent = line.slice(7).trim()
       } else if (line.startsWith('data: ')) {
@@ -65,9 +72,7 @@ export function researchSSE(
 
   xhr.send(JSON.stringify({ query, session_id: sessionId }))
 
-  return {
-    abort: () => xhr.abort(),
-  } as unknown as EventSource
+  return { abort: () => xhr.abort() }
 }
 
 export async function submitHITL(

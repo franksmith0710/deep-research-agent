@@ -5,6 +5,9 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
 from src.config import settings
+from src.logging_config import get_logger
+
+logger = get_logger("embedder")
 
 _device = "cpu"
 _tokenizer: AutoTokenizer | None = None
@@ -15,9 +18,11 @@ def _load() -> None:
     global _tokenizer, _model
     if _tokenizer is not None:
         return
+    logger.debug("Loading BGE-M3 embedder model")
     _tokenizer = AutoTokenizer.from_pretrained(settings.bge_embedder_path)
     _model = AutoModel.from_pretrained(settings.bge_embedder_path)
     _model.eval()
+    logger.debug("BGE-M3 embedder model loaded")
 
 
 def _mean_pooling(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:

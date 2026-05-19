@@ -1,9 +1,15 @@
 import { ref } from 'vue'
+import type { Ref } from 'vue'
 import type { ChainEvent } from '../types'
+import type { HITLEvent } from '../types'
 import { useChatStore } from '../stores/chatStore'
 import { useReportStore } from '../stores/reportStore'
 
-export function useSSE() {
+interface HITLInstance {
+  show: (ev: HITLEvent) => void
+}
+
+export function useSSE(hitl?: Ref<HITLInstance | null> | HITLInstance) {
   const connected = ref(false)
   const chatStore = useChatStore()
   const reportStore = useReportStore()
@@ -23,12 +29,7 @@ export function useSSE() {
         break
       }
       case 'text':
-        chatStore.addMessage({
-          id: Date.now(),
-          role: 'assistant',
-          content: data.content as string,
-          created_at: new Date().toISOString(),
-        })
+        chatStore.appendStream(data.content as string || '')
         break
       case 'patch':
         reportStore.patchSection(
@@ -37,9 +38,14 @@ export function useSSE() {
           data.append as boolean,
         )
         break
-      case 'hitl':
-        // HITL handled by useHITL
+      case 'hitl': {
+        const ev = data as unknown as HITLEvent
+        if (hitl) {
+          const h = 'value' in hitl ? hitl.value : hitl
+          h?.show(ev)
+        }
         break
+      }
     }
   }
 

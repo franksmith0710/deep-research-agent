@@ -24,6 +24,7 @@ from src.agent.nodes import (
     report_node,
     memory_node,
     simple_llm_node,
+    memory_llm_node,
     hitl_scope_node,
     hitl_adjust_node,
     hitl_conflict_node,
@@ -54,6 +55,7 @@ def build_graph() -> StateGraph:
     builder.add_node("report", report_node)
     builder.add_node("memory", memory_node)
     builder.add_node("simple_llm", simple_llm_node)
+    builder.add_node("memory_llm", memory_llm_node)
     builder.add_node("hitl_scope", hitl_scope_node)
     builder.add_node("hitl_adjust", hitl_adjust_node)
     builder.add_node("hitl_conflict", hitl_conflict_node)
@@ -73,7 +75,8 @@ def build_graph() -> StateGraph:
             "simple_llm": "simple_llm",
         },
     )
-    builder.add_edge("simple_llm", END)
+    builder.add_edge("simple_llm", "memory_llm")
+    builder.add_edge("memory_llm", END)
 
     # ── deep_research 路径 ────────────────────────────────────────
     builder.add_edge("check_history", "clarify")

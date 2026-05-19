@@ -35,6 +35,7 @@ class HITLMode(str, Enum):
     scope_select = "scope_select"
     conflict_resolve = "conflict_resolve"
     outline_edit = "outline_edit"
+    direction_adjust = "direction_adjust"
 
 
 class MemoryLevel(str, Enum):
