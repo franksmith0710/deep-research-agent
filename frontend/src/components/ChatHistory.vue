@@ -5,6 +5,7 @@ import { useChatStore } from '../stores/chatStore'
 
 const chatStore = useChatStore()
 const container = ref<HTMLElement>()
+const showHistory = ref(false)
 
 function render(md: string) {
   return marked.parse(md || '') as string
@@ -25,15 +26,25 @@ watch([() => chatStore.messages.length, () => chatStore.streamingText, () => cha
       <div v-else class="bubble">{{ msg.content }}</div>
     </div>
 
-    <div v-if="chatStore.chainEvents.length > 0 && !chatStore.isStreaming" class="thinking-steps">
-      <div
-        v-for="(ev, i) in chatStore.chainEvents"
-        :key="i"
-        class="thinking-step"
-        :class="{ latest: i === chatStore.chainEvents.length - 1 }"
-      >
-        <span class="step-dot"></span>
-        <span class="step-text">{{ ev.content }}</span>
+    <div v-if="chatStore.currentEvent" class="current-step">
+      <span class="step-dot pulse"></span>
+      <span class="step-text">{{ chatStore.currentEvent.content }}</span>
+    </div>
+
+    <div v-if="chatStore.allEvents.length > 1" class="step-history">
+      <button class="history-toggle" @click="showHistory = !showHistory">
+        {{ showHistory ? '收起详细过程' : `查看详细过程 (${chatStore.allEvents.length} 步)` }}
+      </button>
+      <div v-if="showHistory" class="thinking-steps">
+        <div
+          v-for="(ev, i) in chatStore.allEvents"
+          :key="i"
+          class="thinking-step"
+          :class="{ latest: i === chatStore.allEvents.length - 1 }"
+        >
+          <span class="step-dot"></span>
+          <span class="step-text">{{ ev.content }}</span>
+        </div>
       </div>
     </div>
 
@@ -108,6 +119,39 @@ watch([() => chatStore.messages.length, () => chatStore.streamingText, () => cha
   color: #1976d2;
   font-weight: 500;
 }
+
+.current-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  font-size: 14px;
+  color: #1976d2;
+}
+.current-step .step-dot.pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #1976d2;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.step-history {
+  margin-top: 4px;
+}
+.history-toggle {
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 4px 0;
+  text-decoration: underline;
+}
+.history-toggle:hover {
+  color: #1976d2;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 0.4; transform: scale(0.9); }
   50% { opacity: 1; transform: scale(1.1); }

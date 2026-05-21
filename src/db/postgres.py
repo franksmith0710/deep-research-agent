@@ -125,6 +125,24 @@ def get_task_by_session(session_id: str) -> dict[str, Any] | None:
             _pool.putconn(conn)
 
 
+def get_recent_tasks_by_session(session_id: str, limit: int = 10) -> list[dict[str, Any]]:
+    """获取当前 session 最近 N 条任务的 L0 摘要，用于 resolve_context 指代消解。"""
+    with _pool.getconn() as conn:
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """SELECT task_id, query, l0_summary, created_at
+                       FROM research_tasks
+                       WHERE session_id = %s AND l0_summary IS NOT NULL AND l0_summary != ''
+                       ORDER BY created_at DESC
+                       LIMIT %s""",
+                    (session_id, limit),
+                )
+                return cur.fetchall()
+        finally:
+            _pool.putconn(conn)
+
+
 def update_task(task_id: int, **fields: Any) -> None:
     if not fields:
         return

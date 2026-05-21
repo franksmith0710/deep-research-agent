@@ -11,11 +11,13 @@ from src.logging_config import get_logger
 logger = get_logger("planner")
 
 _RESOLVE_PROMPT = """你是一个调研规划助手。用户在一个多轮对话中提出新问题，你需要：
-1. 消解指代："刚才说的那个方面再详细讲讲" → "固态电池量产进展再详细讲讲"
-2. 保持原意，不添加未提及的内容
+1. 消解指代，例如："刚才说的那个方面再详细讲讲" → "固态电池量产进展再详细讲讲"
+2. 结合会话历史上下文，理解当前问题指的是什么
 3. 返回 resolved_query（消解后的查询）
 
-当前已有报告摘要：{l0_summary}
+当前会话历史（最近任务摘要）：
+{session_history}
+
 用户问题：{query}
 
 返回 JSON：{{"resolved_query": "..."}}
@@ -38,13 +40,13 @@ _PLAN_PROMPT = """你是一个搜索规划专家。基于用户的调研需求�
 """
 
 
-def resolve_query(query: str, l0_summary: str = "") -> str:
+def resolve_query(query: str, session_history: str = "") -> str:
     """指代消解：将多轮对话中的指代转换为独立查询。"""
-    logger.debug(f"resolve_query: '{query}' l0_summary={len(l0_summary)}")
+    logger.debug(f"resolve_query: '{query}' history_len={len(session_history)}")
     result = chat_json([
         {"role": "system", "content": "你是调研助手，负责消解指代。请用 JSON 格式回答。"},
         {"role": "user", "content": _RESOLVE_PROMPT.format(
-            l0_summary=l0_summary[:500], query=query
+            session_history=session_history[:500], query=query
         )},
     ])
     resolved = result.get("resolved_query", query)

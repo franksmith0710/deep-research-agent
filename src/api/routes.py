@@ -35,6 +35,9 @@ _interrupted_sessions: dict[str, dict[str, Any]] = {}
 # 每会话的排队列
 _research_locks: dict[str, asyncio.Lock] = {}
 
+# 正在 resume 中的会话，防止并发重复 resume
+_resuming_sessions: set[str] = set()
+
 
 def get_graph():
     global _graph
@@ -181,7 +184,16 @@ async def _run_agent(state: dict[str, Any], sse: SSEManager, lock: asyncio.Lock,
     _interrupted_sessions[session_id] = {"sse": sse, "ctx": ctx, "lock": lock}
 
     graph = get_graph()
-    config = {"configurable": {"thread_id": session_id}}
+    config = {
+        "configurable": {"thread_id": session_id},
+        "metadata": {
+            "session_id": session_id,
+            "query": state["query"][:100],
+            "intent": state.get("intent", "unknown"),
+            "is_resume": ctx is not None,
+        },
+        "tags": ["deep_research"],
+    }
     _interrupted_sessions[session_id]["config"] = config
 
     stream_callback_var.set(lambda token: asyncio.create_task(sse.put_text(token)))
@@ -229,7 +241,7 @@ async def _run_agent(state: dict[str, Any], sse: SSEManager, lock: asyncio.Lock,
         logger.info(f"Agent run completed session_id={session_id}")
 
         if is_first:
-            if report and not report_streamed:
+            if report:
                 await _stream_text(sse, report)
         else:
             for section_name, section_content in sections.items():
@@ -266,17 +278,23 @@ async def hitl_callback(req: HITLRequest):
         logger.warning(f"Session {req.session_id} 状态不完整，忽略")
         return {"status": "skipped", "session_id": req.session_id, "mode": req.mode.value}
 
+    if req.session_id in _resuming_sessions:
+        logger.warning(f"Session {req.session_id} 正在 resume 中，忽略重复 HITL 回调")
+        return {"status": "skipped", "session_id": req.session_id, "mode": req.mode.value, "reason": "会话正在处理中"}
+
+    _resuming_sessions.add(req.session_id)
     ctx = session_data.get("ctx")
-    asyncio.create_task(_resume_agent(sse, config, ctx, req.data, lock))
+    asyncio.create_task(_resume_agent(sse, config, ctx, req.data, lock, req.session_id))
 
     return {"status": "resumed", "session_id": req.session_id, "mode": req.mode.value}
 
 
-async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, Any] | None, resume_data: dict[str, Any] | None = None, lock: asyncio.Lock | None = None):
+async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, Any] | None, resume_data: dict[str, Any] | None = None, lock: asyncio.Lock | None = None, session_id: str | None = None):
     """从 HITL 中断点恢复图执行。"""
-    logger.info(f"Resuming agent session_id={config['configurable']['thread_id']} resume_data={resume_data}")
+    if session_id is None:
+        session_id = config["configurable"]["thread_id"]
+    logger.info(f"Resuming agent session_id={session_id} resume_data={resume_data}")
     graph = get_graph()
-    session_id = config["configurable"]["thread_id"]
     is_first = ctx is None
 
     hitl_triggered = False
@@ -321,7 +339,7 @@ async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, 
         logger.info(f"Agent resume completed session_id={session_id}")
 
         if is_first:
-            if report and not report_streamed:
+            if report:
                 await _stream_text(sse, report)
         else:
             for section_name, section_content in sections.items():
@@ -334,8 +352,9 @@ async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, 
         logger.error(f"Agent resume failed session_id={session_id}: {e}")
         await sse.put_chain("action_result", "error", f"研究过程出错: {e}")
     finally:
+        _resuming_sessions.discard(session_id)
         if not hitl_triggered:
             _interrupted_sessions.pop(session_id, None)
         await sse.put_done()
-        if lock.locked():
+        if lock and lock.locked():
             lock.release()

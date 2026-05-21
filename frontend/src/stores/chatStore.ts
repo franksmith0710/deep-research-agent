@@ -5,7 +5,9 @@ import { useReportStore } from './reportStore'
 
 export const useChatStore = defineStore('chat', () => {
   const messages = ref<ChatMessage[]>([])
-  const chainEvents = ref<ChainEvent[]>([])
+  const allEvents = ref<ChainEvent[]>([])
+  const currentEvent = ref<ChainEvent | null>(null)
+  const chainEvents = allEvents
   const loading = ref(false)
   const streamingText = ref('')
   const isStreaming = ref(false)
@@ -15,7 +17,8 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   function addChainEvent(event: ChainEvent) {
-    chainEvents.value.push(event)
+    allEvents.value.push(event)
+    currentEvent.value = event
   }
 
   function setMessages(msgs: ChatMessage[]) {
@@ -46,12 +49,14 @@ export const useChatStore = defineStore('chat', () => {
     })
     streamingText.value = ''
     isStreaming.value = false
-    chainEvents.value = []
+    allEvents.value = []
+    currentEvent.value = null
   }
 
   function reset() {
     messages.value = []
-    chainEvents.value = []
+    allEvents.value = []
+    currentEvent.value = null
     streamingText.value = ''
     isStreaming.value = false
     const reportStore = useReportStore()
@@ -59,7 +64,7 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   return {
-    messages, chainEvents, loading, streamingText, isStreaming,
+    messages, chainEvents, allEvents, currentEvent, loading, streamingText, isStreaming,
     addMessage, addChainEvent, setMessages, appendStream, finalizeStream, reset,
   }
 })

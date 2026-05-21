@@ -139,5 +139,5 @@ def build_graph() -> StateGraph:
     builder.add_edge("memory", END)
 
     # 编译
-    graph = builder.compile(checkpointer=MemorySaver())
+    graph = builder.compile(checkpointer=MemorySaver(), name="DeepResearch")
     return graph

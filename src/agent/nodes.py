@@ -29,7 +29,7 @@ from src.memory.credibility import update_source_credibility
 from src.db.postgres import (
     update_task, insert_chat_message,
     insert_memory, upsert_credibility, update_memory,
-    get_l2_by_url,
+    get_l2_by_url, get_recent_tasks_by_session,
 )
 
 from src.local_models.embedder import embed_text
@@ -45,7 +45,7 @@ deep_search_count（已使用搜索轮次）：{deep_search_count} / 2
 1. deep_research — 全新话题的深度调研，首次提问时使用
 2. refine_section — 对已有章节的追问（如"再说详细点"），需要补充数据
 3. new_search_topic — 提出一个新方面，需要新增章节
-4. simple_llm — 总结/改写/追问细节，不需要搜索
+4. simple_llm — 总结/改写/追问细节，或查询实时信息（天气、时间、日期、简单百科问答等），不需要搜索
 
 如果意图为 refine_section，请同时指出要细化哪个已有章节（如"核心现状与关键数据"）。
 如果意图为 new_search_topic，请同时指出新主题名称（如"中美政策对比"）。
@@ -114,6 +114,22 @@ _MEMORY_NODE_PROMPT = """你是一个信息压缩专家。将本次研究的最�
 返回 JSON：{{"l0_summary": "..."}}
 """
 
+_MEMORY_FILTER_PROMPT = """你是一个记忆质量评估专家。判断以下发现是否适合存入跨会话长期记忆。
+
+判断标准（满足任一即排除）：
+- ❌ 时效性信息：天气、股价、汇率、今日新闻、比赛比分、会议活动等，时间过去后价值归零
+- ❌ 碎片化：无具体数据、无结论、纯情绪表达
+- ❌ 重复内容：与已有发现高度重复
+- ✅ 适合：结构化事实、数据、观点、结论、政策、流程、教程等，跨时间仍有复用价值
+
+用户原始查询：{query}
+
+发现列表：
+{findings}
+
+返回 JSON：{{"keep_indices": [0, 2, ...], "reasons": {{"0": "时效性信息", "2": "高质量事实"}}}}
+"""
+
 _ADJUST_PROMPT = """你是一个搜索规划专家。判断是否需要用户调整搜索方向。
 
 用户需求：{resolved_query}
@@ -131,12 +147,13 @@ _ADJUST_PROMPT = """你是一个搜索规划专家。判断是否需要用户调
 # ── Node 1: resolve_context ──────────────────────────────────────────
 
 def resolve_context_node(state: AgentState) -> dict[str, Any]:
-    """指代消解：结合已有报告消解当前查询中的指代。"""
+    """指代消解：结合当前 session 历史 L0 摘要消解指代。"""
     logger.debug(f"resolve_context_node query='{state['query']}'")
-    l0 = ""
-    if state.get("page_summaries"):
-        l0 = state["page_summaries"][-1].get("l0_summary", "") if state["page_summaries"] else ""
-    resolved = resolve_query(state["query"], l0)
+    session_id = state["session_id"]
+    tasks = get_recent_tasks_by_session(session_id, limit=10)
+    l0s = [t.get("l0_summary", "") for t in tasks if t.get("l0_summary")]
+    session_history = "\n".join(f"- {s}" for s in l0s) if l0s else "无历史摘要"
+    resolved = resolve_query(state["query"], session_history)
     return {"resolved_query": resolved}
 
 
@@ -279,8 +296,13 @@ def search_node(state: AgentState) -> dict[str, Any]:
         except Exception as e:
             logger.warning(f"fallback 也失败: {e}")
 
+    search_all_failed = not all_results
     increment = 1 if state.get("intent") == "deep_research" else 0
-    return {"search_results": all_results, "deep_search_count": state.get("deep_search_count", 0) + increment}
+    return {
+        "search_results": all_results,
+        "search_all_failed": search_all_failed,
+        "deep_search_count": state.get("deep_search_count", 0) + increment,
+    }
 
 
 # ── Node 7: scrape ──────────────────────────────────────────────────
@@ -382,6 +404,15 @@ def assess_node(state: AgentState) -> dict[str, Any]:
     findings = state.get("findings", [])
     summaries = state.get("page_summaries", [])
     deep_count = state.get("deep_search_count", 0)
+
+    if state.get("search_all_failed") and not findings:
+        logger.info("搜索全部失败且无已有 findings，标记为需要 LLM fallback")
+        return {
+            "sufficient": True,
+            "has_conflict": False,
+            "_llm_fallback": True,
+            "sub_queries": state.get("sub_queries", []),
+        }
     
     dimensions = list(set(f.get("topic", "") for f in findings if f.get("topic")))
     l0_text = "\n".join(
@@ -400,10 +431,49 @@ def assess_node(state: AgentState) -> dict[str, Any]:
     ])
     
     new_sub = result.get("new_sub_queries", [])
+    has_conflict = result.get("has_conflict", False)
+    conflict_description = result.get("conflict_description", "")
+
+    if has_conflict and findings:
+        logger.info("检测到信息冲突，尝试实时抓取原文进行二次裁决")
+        conflict_urls = list(set(f.get("source_url", "") for f in findings if f.get("source_url")))
+        if conflict_urls:
+            try:
+                from src.search.scraper import Scraper
+                scraper = Scraper()
+                conflict_contents = []
+                for url in conflict_urls[:3]:
+                    try:
+                        page = scraper.scrape(url)
+                        if page.success and page.content:
+                            conflict_contents.append(f"来源: {url}\n标题: {page.title}\n内容:\n{page.content[:2000]}")
+                    except Exception:
+                        logger.warning(f"冲突源抓取失败: {url}")
+                if conflict_contents:
+                    conflict_context = "\n\n---\n\n".join(conflict_contents)
+                    resolve_result = chat_json([
+                        {"role": "system", "content": "你是一个事实核查专家。根据多个来源的原文内容，判断哪个说法更可信，裁决矛盾。"},
+                        {"role": "user", "content": f"""用户查询：{query}
+冲突描述：{conflict_description}
+
+各来源原文：
+{conflict_context}
+
+请判断哪个结论是正确的，或者是否需要更多信息。返回 JSON：
+{{"conclusion": "你的裁决结论", "reason": "为什么选这个", "has_conflict": false}}
+如果无法裁决，返回 {{"has_conflict": true, "reason": "..."}}"""},
+                    ])
+                    if not resolve_result.get("has_conflict", True):
+                        logger.info("冲突已通过原文核实解决")
+                        has_conflict = False
+                        conflict_description = resolve_result.get("conclusion", "")
+            except Exception:
+                logger.exception("冲突裁决失败，保持原冲突状态")
+
     return {
         "sufficient": result.get("sufficient", True),
-        "has_conflict": result.get("has_conflict", False),
-        "conflict_description": result.get("conflict_description", ""),
+        "has_conflict": has_conflict,
+        "conflict_description": conflict_description,
         "sub_queries": new_sub if new_sub else state.get("sub_queries", []),
     }
 
@@ -414,6 +484,16 @@ def synthesize_node(state: AgentState) -> dict[str, Any]:
     """综合生成新章节内容。"""
     logger.debug(f"synthesize_node findings={len(state.get('findings', []))}")
     findings = state.get("findings", [])
+
+    if state.get("_llm_fallback") and not findings:
+        logger.info("使用 LLM 直接回答（搜索失败 fallback）")
+        query = state.get("resolved_query", state["query"])
+        response = chat([
+            {"role": "system", "content": "你是一个智能助手。请直接回答用户问题。"},
+            {"role": "user", "content": query},
+        ])
+        return {"sections": {"answer": response}}
+
     if not findings:
         return {}
 
@@ -436,8 +516,10 @@ def synthesize_node(state: AgentState) -> dict[str, Any]:
 # ── Node 13: report ─────────────────────────────────────────────────
 
 def _build_footnotes(state: AgentState) -> str:
-    """从 scraped_pages 的 L2 记忆构建引用脚注。"""
+    """从 memory_store L2 构建引用脚注（含 snippet 预览）。"""
     from src.memory.credibility import get_source_tag
+    from src.db.postgres import get_l2_by_url
+
     seen = set()
     notes = []
     for p in state.get("scraped_pages", []):
@@ -445,8 +527,20 @@ def _build_footnotes(state: AgentState) -> str:
         if not url or url in seen:
             continue
         seen.add(url)
+
         tag = get_source_tag(url)
-        notes.append(f"- [{tag}] {url}")
+        l2_records = get_l2_by_url(url)
+        snippet = ""
+        title = ""
+        if l2_records and l2_records[0].get("content"):
+            snippet = l2_records[0]["content"][:200]
+            title = l2_records[0].get("topic", "")
+
+        if snippet:
+            notes.append(f"- [{tag}] **{title}**\n  {snippet}\n  [{url}]")
+        else:
+            notes.append(f"- [{tag}] {url}")
+
     if not notes:
         return ""
     return "\n\n---\n### 来源\n" + "\n".join(notes)
@@ -473,28 +567,16 @@ async def report_node(state: AgentState) -> dict[str, Any]:
 
     footnotes = _build_footnotes(state)
 
-    sse_callback = stream_callback_var.get()
-    if sse_callback:
-        result = await generate_report_stream(query, outline, findings, on_token=sse_callback)
-        report = result.get("report", "")
-        if footnotes:
-            report += footnotes
-        return {
-            "report": report,
-            "sections": result.get("sections", {}),
-            "outline": outline,
-            "_report_streamed": True,
-        }
-    else:
-        result = generate_report(query, outline, findings)
-        report = result.get("report", "")
-        if footnotes:
-            report += footnotes
-        return {
-            "report": report,
-            "sections": result.get("sections", {}),
-            "outline": outline,
-        }
+    result = await generate_report_stream(query, outline, findings, on_token=None)
+    report = result.get("report", "")
+    if footnotes:
+        report += footnotes
+    return {
+        "report": report,
+        "sections": result.get("sections", {}),
+        "outline": outline,
+        "_report_streamed": True,
+    }
 
 
 # ── Node 14: memory ─────────────────────────────────────────────────
@@ -526,36 +608,65 @@ def memory_node(state: AgentState) -> dict[str, Any]:
             logger.exception("memory_node L0 compression failed")
 
     # 写 L1 到 memory_store（含 embedding 用于跨会话语义检索）
+    # 先用 LLM 过滤掉不适合长期存储的发现
+    high_quality_findings = []
     for f in findings:
         content = f.get("content", "")
-        if not content:
-            continue
-        try:
-            check = dedup_check(content)
-            if check["is_duplicate"] and check["matched_id"]:
-                update_memory(check["matched_id"], content)
-            else:
-                emb = embed_text(content)
-                insert_memory(
-                    task_id=task_id,
-                    level="L1",
-                    content=content,
-                    source_url=f.get("source_url", ""),
-                    topic=f.get("topic", ""),
-                    embedding=emb,
-                )
-        except Exception:
-            logger.exception("memory_node L1 insert failed")
+        if content and len(content) >= 50:
+            high_quality_findings.append(f)
 
-    # 写 L2 到 memory_store
-    for p in state.get("scraped_pages", []):
-        if p.get("success") and p.get("content"):
+    keep_indices = []
+    if high_quality_findings:
+        try:
+            result = chat_json([
+                {"role": "system", "content": "你是一个记忆质量评估专家。请用 JSON 格式回答。"},
+                {"role": "user", "content": _MEMORY_FILTER_PROMPT.format(
+                    query=state.get("resolved_query", state.get("query", "")),
+                    findings="\n".join(f"{i}. {f['content'][:300]}" for i, f in enumerate(high_quality_findings))
+                )},
+            ])
+            keep_indices = result.get("keep_indices", [])
+            logger.info(f"memory_node LLM 过滤: 原始 {len(findings)} 条, 通过 {len(keep_indices)} 条")
+        except Exception:
+            logger.exception("memory_node LLM 过滤失败，回退到全部写入")
+            keep_indices = list(range(len(high_quality_findings)))
+
+    # 写入通过过滤的 L1
+    for i in keep_indices:
+        if 0 <= i < len(high_quality_findings):
+            f = high_quality_findings[i]
+            content = f.get("content", "")
             try:
+                check = dedup_check(content)
+                if check["is_duplicate"] and check["matched_id"]:
+                    update_memory(check["matched_id"], content)
+                else:
+                    emb = embed_text(content)
+                    insert_memory(
+                        task_id=task_id,
+                        level="L1",
+                        content=content,
+                        source_url=f.get("source_url", ""),
+                        topic=f.get("topic", ""),
+                        embedding=emb,
+                    )
+            except Exception:
+                logger.exception("memory_node L1 insert failed")
+
+    # 写 L2 到 memory_store（只存 url + title + snippet，用于前端引用展示）
+    for p in state.get("scraped_pages", []):
+        if p.get("success"):
+            try:
+                snippet = p.get("snippet", "")[:500] if p.get("snippet") else ""
+                if not snippet and p.get("content"):
+                    snippet = p.get("content", "")[:500]
                 insert_memory(
                     task_id=task_id,
                     level="L2",
-                    content=p["content"][:5000],
+                    content=snippet,
                     source_url=p.get("url", ""),
+                    topic=p.get("title", ""),
+                    embedding=None,
                 )
             except Exception:
                 logger.exception("memory_node L2 insert failed")

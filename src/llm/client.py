@@ -4,7 +4,7 @@ import json
 import time
 from typing import Any, AsyncGenerator
 
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from openai import (
     APIError,
     APIConnectionError,
@@ -17,7 +17,8 @@ from src.logging_config import get_logger
 
 logger = get_logger("llm")
 
-_client: OpenAI | None = None
+_sync_client: OpenAI | None = None
+_async_client: AsyncOpenAI | None = None
 
 
 async def chat_stream(
@@ -27,7 +28,7 @@ async def chat_stream(
     timeout: float = 60.0,
 ) -> AsyncGenerator[str, None]:
     """流式调用 LLM，逐 token 产出。"""
-    client = get_client()
+    client = await get_async_client()
     kwargs: dict[str, Any] = {
         "model": settings.deepseek_model,
         "messages": messages,
@@ -72,14 +73,24 @@ async def chat_stream(
     raise RuntimeError(f"LLM 流式调用失败（{max_retries} 次重试后）: {last_error}")
 
 
-def get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI(
+def get_sync_client() -> OpenAI:
+    global _sync_client
+    if _sync_client is None:
+        _sync_client = OpenAI(
             api_key=settings.deepseek_api_key,
             base_url=settings.deepseek_base_url,
         )
-    return _client
+    return _sync_client
+
+
+async def get_async_client() -> AsyncOpenAI:
+    global _async_client
+    if _async_client is None:
+        _async_client = AsyncOpenAI(
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
+        )
+    return _async_client
 
 
 SYSTEM_PROMPT = """你是一个专业的调研助手，负责帮助用户进行多轮深度研究。
@@ -93,7 +104,7 @@ def chat(
     timeout: float = 60.0,
 ) -> str:
     """调用 DeepSeek Chat API，自动重试（最多 4 次）。"""
-    client = get_client()
+    client = get_sync_client()
     kwargs: dict[str, Any] = {
         "model": settings.deepseek_model,
         "messages": messages,
