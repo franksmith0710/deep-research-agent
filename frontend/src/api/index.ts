@@ -43,6 +43,7 @@ export function researchSSE(
   xhr.responseType = 'text'
 
   let buffer = ''
+  let done = false
 
   xhr.onprogress = () => {
     buffer += xhr.responseText.slice(buffer.length)
@@ -61,8 +62,14 @@ export function researchSSE(
     }
   }
 
-  xhr.onerror = () => onError('连接失败')
+  xhr.onerror = () => {
+    if (done) return
+    done = true
+    onError('连接失败')
+  }
   xhr.onloadend = () => {
+    if (done) return
+    done = true
     if (xhr.status >= 200 && xhr.status < 300) {
       onDone()
     } else {

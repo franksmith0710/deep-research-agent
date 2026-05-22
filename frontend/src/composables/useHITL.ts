@@ -3,6 +3,7 @@ import type { HITLEvent } from '../types'
 import { submitHITL } from '../api'
 
 let sseActive = false
+let pendingSubmit = false
 
 export function useHITL() {
   const showDialog = ref(false)
@@ -14,6 +15,7 @@ export function useHITL() {
 
   function show(ev: HITLEvent) {
     if (!sseActive) return
+    if (pendingSubmit) return
     currentHITL.value = ev
     showDialog.value = true
   }
@@ -25,11 +27,13 @@ export function useHITL() {
 
   async function submit(data: Record<string, unknown>) {
     const hitl = currentHITL.value
-    if (!hitl) return
+    if (!hitl || pendingSubmit) return
+    pendingSubmit = true
     try {
       await submitHITL(hitl.session_id, hitl.mode, data)
     } finally {
       close()
+      pendingSubmit = false
     }
   }
 
