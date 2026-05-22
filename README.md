@@ -9,45 +9,43 @@
 ```
 【前端 Vue 3】 ←── SSE + REST ──→ 【FastAPI 后端】 ←── LangGraph ──→ 【Viking Memory Store】
                                            ↕                                 ↕
-                                    20 节点 Agent 调度                PostgreSQL + pgvector
+                                    19 节点 Agent 调度                PostgreSQL + pgvector
 ```
 
 ### Agent 流程图
 
 ```
 入口 → resolve_context → intent_classifier
-                               │
-               ┌───────────────┼───────────────┐
-               ▼               ▼               ▼
-         check_history    refine/new_search  simple_llm → END
-               ▼               └──────┬─────────┘
-            clarify                      │
-          ╱       ╲                     │
-     hitl_scope    planner              │
-         │        ╱╲                   │
-         ▼       /  ╲                  │
-       planner hitl_adjust             │
-           \     /                     │
-            ▼   ▼                      │
-            search ◄───────────────────┘
-              │
-              ▼
-           scrape → context_mgr → dedup → rerank
-              │
-              ▼
-           assess ──────┬──────┐
-            ╱╲          │      │
-       hitl_conflict    │      │
-           │            ▼      ▼
-           │      search ◄────┘（最多 2 轮回环）
-           ▼
-        synthesize
-           │
-           ▼
-        hitl_outline
-           │
-           ▼
-        report → memory → END
+                                │
+                ┌───────────────┼────────────────┐
+                ▼               ▼                ▼
+          check_history    refine_section    simple_llm
+                ▼               │                ▼
+             planner            │          memory_llm → END
+            ╱      ╲           │
+      hitl_adjust   search ◄───┘
+           │          │
+           └────────→ │
+                      ▼
+                   scrape → context_mgr → dedup_rerank
+                      │
+                      ▼
+                   clarify ──→ hitl_scope ──→ planner
+                      │
+                      ▼
+                   assess ───────┬─────────┐
+                    ╱╲           │         │
+               hitl_conflict     │         │
+                   │             ▼         ▼
+                    │         search ◄─────┘ (最多 2 轮回环)
+                   ▼
+                synthesize
+                   │
+                   ▼
+                hitl_outline
+                   │
+                   ▼
+                report → memory → END
 ```
 
 ---
@@ -58,10 +56,10 @@
 
 | 意图 | 触发场景 | 执行链路 |
 |------|----------|----------|
-| `deep_research` | 首次提问 / 全新话题 | resolve → history → clarify → planner → search → scrape → dedup → rerank → assess(最多2轮) → synthesize → report → memory |
-| `refine_section` | 追问已有章节详情 | 仅 search(限定章节) → scrape → dedup → rerank → synthesize → report(patch替换) → memory |
-| `new_search_topic` | 提出新方面 | 仅 search(新话题) → scrape → dedup → rerank → synthesize → report(patch追加) → memory |
-| `simple_llm` | 总结 / 改写 / 追问细节 | 直接 LLM 回答，不搜索不写记忆 |
+| `deep_research` | 首次提问 / 全新话题 | resolve → history → planner → search → scrape → context_mgr → dedup_rerank → clarify → assess(最多 2 轮) → synthesize → report → memory |
+| `refine_section` | 追问已有章节详情 | 仅 search(限定章节) → scrape → context_mgr → dedup_rerank → synthesize → report(patch替换) → memory |
+| `new_search_topic` | 提出新方面 | resolve → history → planner → search → scrape → context_mgr → dedup_rerank → clarify → assess → synthesize → report(patch追加) → memory |
+| `simple_llm` | 总结 / 改写 / 追问细节 | 直接 LLM 回答，不搜索，仅写聊天记录（memory_llm） |
 
 ### 4 个 HITL 人工介入点
 
@@ -95,7 +93,7 @@ assess 节点判断当前收集信息是否充足：
 
 | event | 触发时机 | 前端行为 |
 |-------|----------|----------|
-| `chain` | 每个节点执行 | ThoughtBlock 展示（thought / action / action_result 三种样式） |
+| `chain` | 每个节点执行 | ChatHistory 内联渲染（thought / action / action_result 三种样式） |
 | `text` | 首次 deep_research | 打字机流式渲染完整报告 |
 | `patch` | refine / new_search | 增量替换或追加报告章节（携带 append 标记） |
 | `hitl` | HITL 中断触发 | 弹出模态对话框 |
@@ -117,12 +115,12 @@ assess 节点判断当前收集信息是否充足：
 
 | 指标 | 数值 |
 |------|------|
-| LangGraph 节点数 | 20（16 功能节点 + 4 HITL 中断节点） |
+| LangGraph 节点数 | 19（15 功能节点 + 4 HITL 中断节点） |
 | 意图路由数 | 4 |
-| 最大深度搜索轮次 | 2（会话级全局共享） |
+| 最大深度搜索轮次 | 2（会话级全局共享，route_assess 动态阈值） |
 | 每轮子查询数 | 3-5 |
-| 每子查询搜索结果数 | 5 |
-| 最大抓取 URL 数 | 10 |
+| 每子查询搜索结果数 | 3 |
+| 最大抓取 URL 数 | 5 |
 | LLM 最大重试次数 | 4 |
 | LLM temperature | 0.3 |
 | embedding 维度 | 1024（bge-m3） |
@@ -151,7 +149,7 @@ assess 节点判断当前收集信息是否充足：
 | 重排模型 | bge-reranker-v2-m3 (sentence-transformers，本地) |
 | 搜索引擎 | DuckDuckGo |
 | 网页提取 | trafilatura + httpx |
-| 前端 | Vue 3 + Vite + Pinia |
+| 前端 | Vue 3 + Vite + Pinia + marked |
 | 日志 | Loguru |
 | 监控 | LangSmith |
 
@@ -167,11 +165,11 @@ src/
 ├── logging_config.py        # Loguru 配置
 ├── agent/
 │   ├── state.py             # AgentState TypedDict（30+ 字段）
-│   ├── nodes.py             # 16 功能节点 + 4 HITL 节点 + 3 路由函数
+│   ├── nodes.py             # 15 功能节点 + 4 HITL 节点 + 3 路由函数
 │   └── graph.py             # LangGraph StateGraph 编排
 ├── api/
 │   ├── server.py            # FastAPI 应用 + CORS
-│   ├── routes.py            # 5 REST 端点 + SSE 流 + HITL 回调恢复
+│   ├── routes.py            # 6 REST 端点 + SSE 流 + HITL 回调恢复
 │   ├── sse_manager.py       # 异步队列 SSE 管理
 │   └── contexts.py          # contextvars 流式回调
 ├── db/
@@ -200,6 +198,9 @@ src/
     └── credibility.py       # 来源信誉评分管理
 
 frontend/src/
+├── App.vue                  # 根组件
+├── main.ts                  # Vue 应用入口
+├── types.ts                 # TypeScript 类型定义
 ├── api/index.ts             # REST + SSE 客户端封装
 ├── stores/
 │   ├── chatStore.ts         # 对话消息 + chain 事件
@@ -210,13 +211,12 @@ frontend/src/
 │   └── useHITL.ts          # HITL 弹窗控制
 └── components/
     ├── Sidebar.vue          # 左侧会话列表
-    ├── MainArea.vue          # 右侧主窗口容器
-    ├── ChatHistory.vue       # 对话历史
-    ├── ThoughtBlock.vue      # chain 事件展示
-    ├── ReportBlock.vue       # 持续更新报告块
-    ├── ReportViewer.vue      # Markdown 渲染 + 引用跳转
-    ├── QueryInput.vue        # 底部输入框
-    └── HITLDialog.vue        # HITL 交互弹窗
+    ├── SessionList.vue      # 会话列表容器
+    ├── SessionItem.vue      # 会话列表中单个条目
+    ├── MainArea.vue         # 右侧主窗口容器
+    ├── ChatHistory.vue      # 对话历史 + chain 事件内联渲染
+    ├── QueryInput.vue       # 底部输入框
+    └── HITLDialog.vue       # HITL 交互弹窗
 
 migration/
 └── 001_init.sql             # 4 表 DDL + pgvector HNSW 索引
@@ -318,7 +318,7 @@ data: {"mode": "scope_select", "session_id": "abc123", "options": {"dimensions":
 单链路无法同时满足"快速回答"和"深度调研"两种需求。4 条路径使 Agent 可以根据用户意图选择最短执行路径：
 - `simple_llm` 不经过任何搜索节点，延迟最低
 - `refine_section` / `new_search_topic` 不走 assess 回环，单轮即止
-- `deep_research` 才触发最多 2 轮覆盖度评估循环
+- `deep_research` 才触发覆盖度评估循环（最多 2 轮，动态阈值）
 
 ### 为什么要 4 种 SSE 事件
 
@@ -377,3 +377,28 @@ if "__interrupt__" in event:
 # 恢复执行
 graph.astream(Command(resume={"dimensions": ["市场规模"]}), config)
 ```
+
+
+
+
+分析完毕。问题根因是 appendStream 的首次替换逻辑 + marked.parse CSP 拦截可能性 + 历史加载重复风险。具体诊断：
+appendStream (chatStore.ts:33-39):
+function appendStream(chunk: string) {
+    if (!isStreaming.value) {           // ← 首次：replace
+      isStreaming.value = true
+      streamingText.value = chunk
+    } else {
+      streamingText.value += chunk      // ← 后续：append
+    }
+}
+如果 SSE 连接中途因某种原因 finalizeStream() 重置了 isStreaming=false（例如错误恢复、重连），后续到达的 text 事件会用 = 替换而非 += 追加，导致内容截断或重复。
+loadReport 去重 (MainArea.vue:15-27):
+m.role === 'assistant' && m.content === report  // 精确字符串匹配
+报告中有 footnotes 在 report_node 中拼接（nodes.py:678），而持久化的 sections 重建可能不含注脚 → 字符串不同 → loadReport 添加第二条重复消息。
+修复方案
+#	文件	问题	修复
+1	chatStore.ts	appendStream 首次用 = 替换	改为始终用 +=，首次初始化 streamingText = ''
+2	MainArea.vue	loadReport 精确匹配太脆弱	改为 includes 子串匹配 + 去重键（如长度阈值）
+3	ChatHistory.vue	CSP 可能拦截 v-html	添加 marked.parse 异常兜底，出错时显示纯文本
+4	ChatHistory.vue	无防抖，高频更新卡顿	streamingText 添加 requestAnimationFrame 节流
+5	routes.py	patch 事件在 agent 完成后全量推送	不改（逻辑正确，仅用于持久化）

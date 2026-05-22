@@ -13,5 +13,5 @@ class SearchResultItem:
 
 class SearchEngine(ABC):
     @abstractmethod
-    def search(self, query: str, num_results: int = 10) -> list[SearchResultItem]:
+    def search(self, query: str, num_results: int = 5) -> list[SearchResultItem]:
         ...

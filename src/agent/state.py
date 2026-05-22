@@ -52,10 +52,12 @@ class AgentState(TypedDict):
     
     # HITL 条件标记
     need_scope: bool
+    _clarify_done: bool
     need_adjust: bool
     has_conflict: bool
     conflict_description: str
     sufficient: bool
+    coverage_score: int
     need_outline_review: bool
     hitl_result: dict[str, Any]  # 用户 HITL 输入
     
@@ -89,10 +91,12 @@ def make_initial_state(
         "deep_search_count": 0,
         "refine_section_name": "",
         "need_scope": False,
+        "_clarify_done": False,
         "need_adjust": False,
         "has_conflict": False,
         "conflict_description": "",
         "sufficient": True,
+        "coverage_score": 0,
         "need_outline_review": False,
         "hitl_result": {},
         "status": "pending",

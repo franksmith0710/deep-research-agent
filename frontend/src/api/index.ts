@@ -75,6 +75,10 @@ export function researchSSE(
   return { abort: () => xhr.abort() }
 }
 
+export async function cancelResearch(sessionId: string): Promise<void> {
+  await fetch(`${BASE}/research/${sessionId}/cancel`, { method: 'POST' })
+}
+
 export async function submitHITL(
   sessionId: string,
   mode: string,

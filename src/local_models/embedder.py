@@ -9,7 +9,7 @@ from src.logging_config import get_logger
 
 logger = get_logger("embedder")
 
-_device = "cpu"
+_device = "cuda"
 _tokenizer: AutoTokenizer | None = None
 _model: AutoModel | None = None
 
@@ -20,9 +20,9 @@ def _load() -> None:
         return
     logger.debug("Loading BGE-M3 embedder model")
     _tokenizer = AutoTokenizer.from_pretrained(settings.bge_embedder_path)
-    _model = AutoModel.from_pretrained(settings.bge_embedder_path)
+    _model = AutoModel.from_pretrained(settings.bge_embedder_path).to(_device)
     _model.eval()
-    logger.debug("BGE-M3 embedder model loaded")
+    logger.debug(f"BGE-M3 embedder model loaded on {_device}")
 
 
 def _mean_pooling(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -36,6 +36,7 @@ def embed_text(text: str | list[str]) -> list[float] | list[list[float]]:
     single = isinstance(text, str)
     texts = [text] if single else text
     encoded = _tokenizer(texts, padding=True, truncation=True, return_tensors="pt", max_length=512)
+    encoded = {k: v.to(_device) for k, v in encoded.items()}
     with torch.no_grad():
         outputs = _model(**encoded)
         emb = _mean_pooling(outputs.last_hidden_state, encoded["attention_mask"])

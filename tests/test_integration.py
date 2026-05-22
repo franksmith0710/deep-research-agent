@@ -93,7 +93,7 @@ print(f"[PASS] credibility: {tag}")
 # 15. graph
 from src.agent.graph import build_graph
 g = build_graph()
-assert len(list(g.nodes.keys())) >= 15
+assert len(list(g.nodes.keys())) >= 19
 print(f"[PASS] graph ({len(list(g.nodes.keys()))} nodes)")
 
 # 16. SSE

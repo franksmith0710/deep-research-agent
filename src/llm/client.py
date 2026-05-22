@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any, AsyncGenerator
@@ -57,12 +58,12 @@ async def chat_stream(
             logger.warning(f"LLM stream retry {attempt + 1}/{max_retries} error={e}")
             if attempt < max_retries - 1:
                 wait = min(2 ** attempt + 1, 10)
-                time.sleep(wait)
+                await asyncio.sleep(wait)
         except APIError as e:
             last_error = e
             logger.warning(f"LLM stream retry {attempt + 1}/{max_retries} error={e}")
             if attempt < max_retries - 1 and 500 <= e.status_code < 600:
-                time.sleep(min(2 ** attempt + 1, 10))
+                await asyncio.sleep(min(2 ** attempt + 1, 10))
             else:
                 break
         except Exception as e:

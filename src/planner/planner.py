@@ -28,6 +28,11 @@ _CLARIFY_PROMPT = """你需要判断用户的查询是否需要补充范围。�
 
 用户查询：{resolved_query}
 
+{preliminary_findings}
+
+注意：已有一轮搜索结果，请基于已有信息判断是否仍需要用户澄清范围。
+如果已有信息足够覆盖用户查询的核心维度，则不应再要求澄清。
+
 返回 JSON：{{"need_scope": true/false, "suggested_dimensions": ["维度1", "维度2", ...]}}
 """
 
@@ -54,11 +59,14 @@ def resolve_query(query: str, session_history: str = "") -> str:
     return resolved
 
 
-def need_clarification(resolved_query: str) -> dict[str, Any]:
+def need_clarification(resolved_query: str, preliminary_findings: str = "") -> dict[str, Any]:
     """判断是否需要用户补充范围。返回 {need_scope, suggested_dimensions}。"""
     result = chat_json([
         {"role": "system", "content": "你是调研助手，负责判断是否需要澄清范围。请用 JSON 格式回答。"},
-        {"role": "user", "content": _CLARIFY_PROMPT.format(resolved_query=resolved_query)},
+        {"role": "user", "content": _CLARIFY_PROMPT.format(
+            resolved_query=resolved_query,
+            preliminary_findings=preliminary_findings,
+        )},
     ])
     need_scope = result.get("need_scope", False)
     dims = result.get("suggested_dimensions", [])

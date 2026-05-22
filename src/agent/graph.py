@@ -1,4 +1,4 @@
-"""LangGraph 图构建：15 节点 + intent 4 分支 + 4 HITL 中断点 + assess 回环 + intent 分叉。"""
+"""LangGraph 图构建：15 节点 + intent 4 分支 + 4 HITL 中断点 + assess 回环 + clarify 后置。"""
 
 from __future__ import annotations
 
@@ -17,8 +17,7 @@ from src.agent.nodes import (
     search_node,
     scrape_node,
     context_mgr_node,
-    dedup_node,
-    rerank_node,
+    dedup_rerank_node,
     assess_node,
     synthesize_node,
     report_node,
@@ -39,7 +38,7 @@ def build_graph() -> StateGraph:
     """构建完整的 LangGraph。"""
     builder = StateGraph(AgentState)
 
-    # ── 注册节点（15 + 4 HITL = 19 个） ─────────────────────────────
+    # ── 注册节点（15 functional + 4 HITL = 19 个） ─────────────────
     builder.add_node("resolve_context", resolve_context_node)
     builder.add_node("intent_classifier", intent_classifier_node)
     builder.add_node("check_history", check_history_node)
@@ -48,8 +47,7 @@ def build_graph() -> StateGraph:
     builder.add_node("search", search_node)
     builder.add_node("scrape", scrape_node)
     builder.add_node("context_mgr", context_mgr_node)
-    builder.add_node("dedup", dedup_node)
-    builder.add_node("rerank", rerank_node)
+    builder.add_node("dedup_rerank", dedup_rerank_node)
     builder.add_node("assess", assess_node)
     builder.add_node("synthesize", synthesize_node)
     builder.add_node("report", report_node)
@@ -78,16 +76,8 @@ def build_graph() -> StateGraph:
     builder.add_edge("simple_llm", "memory_llm")
     builder.add_edge("memory_llm", END)
 
-    # ── deep_research 路径 ────────────────────────────────────────
-    builder.add_edge("check_history", "clarify")
-
-    # clarifiy → hitl_scope（如需范围选择）/ planner
-    builder.add_conditional_edges(
-        "clarify",
-        lambda s: "hitl_scope" if s.get("need_scope", False) else "planner",
-        {"hitl_scope": "hitl_scope", "planner": "planner"},
-    )
-    builder.add_edge("hitl_scope", "planner")
+    # ── deep_research / new_search_topic 路径 ────────────────────────
+    builder.add_edge("check_history", "planner")
 
     # planner → hitl_adjust（如需方向微调）/ search
     builder.add_conditional_edges(
@@ -100,19 +90,26 @@ def build_graph() -> StateGraph:
     # ── 搜索路径（三条路径共用） ──────────────────────────────────
     builder.add_edge("search", "scrape")
     builder.add_edge("scrape", "context_mgr")
-    builder.add_edge("context_mgr", "dedup")
-    builder.add_edge("dedup", "rerank")
+    builder.add_edge("context_mgr", "dedup_rerank")
 
-    # rerank → assess / synthesize / report（由 intent 决定）
+    # dedup_rerank → clarify（首次搜索后判断范围）/ assess（后续循环）/ synthesize（refine）
     builder.add_conditional_edges(
-        "rerank",
+        "dedup_rerank",
         route_after_rerank,
         {
+            "clarify": "clarify",
             "assess": "assess",
             "synthesize": "synthesize",
-            "report": "report",
         },
     )
+
+    # clarify → hitl_scope（如需范围选择，选择后重新规划）/ assess（直接进入覆盖评估）
+    builder.add_conditional_edges(
+        "clarify",
+        lambda s: "hitl_scope" if s.get("need_scope", False) else "assess",
+        {"hitl_scope": "hitl_scope", "assess": "assess"},
+    )
+    builder.add_edge("hitl_scope", "planner")
 
     # ── assess 回环（仅 deep_research） ─────────────────────────
     builder.add_conditional_edges(

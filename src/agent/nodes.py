@@ -14,6 +14,8 @@ from src.config import settings
 from src.logging_config import get_logger
 
 logger = get_logger("nodes")
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from src.llm.client import chat, chat_json
 from src.api.contexts import stream_callback_var
 from src.planner.planner import resolve_query, need_clarification, generate_sub_queries
@@ -23,13 +25,14 @@ from src.extract.extractor import extract_from_content
 from src.synthesize.deduplicator import dedup_check
 from src.synthesize.ranker import rank_findings
 from src.synthesize.synthesizer import synthesize_section
-from src.report.writer import generate_outline, generate_report, generate_report_stream
+from src.report.writer import generate_outline, generate_report_stream
 from src.memory.retriever import retrieve_l1
-from src.memory.credibility import update_source_credibility
+from src.memory.credibility import update_source_credibility, get_credibility, get_source_tag
 from src.db.postgres import (
     update_task, insert_chat_message,
     insert_memory, upsert_credibility, update_memory,
     get_l2_by_url, get_recent_tasks_by_session,
+    search_memory_by_vector,
 )
 
 from src.local_models.embedder import embed_text
@@ -82,21 +85,29 @@ _CHECK_HISTORY_PROMPT = """你是一个记忆检索专家。根据用户查询�
 返回 JSON：{{"related_memories": [记忆ID列表], "summary": "历史信息摘要"}}
 """
 
-_ASSESS_PROMPT = """你是一个研究覆盖度评估专家。判断当前收集的信息是否足够生成一份完整的报告。
+_ASSESS_PROMPT = """你是一个研究覆盖度评估专家。判断当前收集的信息是否足够生成一份完整的报告，并给出信息覆盖率评分。
 
-当前进度：已完成 {search_count} 轮深度搜索（上限 2 轮）
+当前进度：已完成 {search_count} 轮深度搜索
 已收集发现数：{findings_count}
 覆盖的维度：{dimensions}
 L0 摘要列表：
 {l0_summaries}
 
-判断标准：
-- 如果信息覆盖了核心维度且有足够数据点 → 可以结束搜索
-- 如果缺少关键维度或数据点不足 → 需要继续搜索
+评分标准（覆盖率 0-100）：
+- 0-30：严重不足，大部分核心维度缺失
+- 31-50：部分覆盖，关键维度仍有缺口
+- 51-70：基本覆盖，但某些方面不够深入
+- 71-85：良好覆盖，主要维度有足够数据点
+- 86-100：全面覆盖，所有维度信息充分
+
+决策规则：
+- 覆盖率 < 70 → 需要继续搜索（返回 new_sub_queries）
+- 覆盖率 ≥ 70 → 信息足够，可以结束搜索
 
 用户查询：{query}
 
 返回 JSON：{{
+    "coverage_score": 0-100,
     "sufficient": true/false,
     "reason": "...",
     "missing_dimensions": ["..."],
@@ -220,16 +231,29 @@ def check_history_node(state: AgentState) -> dict[str, Any]:
 # ── Node 4: clarify ──────────────────────────────────────────────────
 
 def clarify_node(state: AgentState) -> dict[str, Any]:
-    """判断是否需要用户补充范围。"""
+    """判断是否需要用户补充范围（基于初步搜索结果，信息不足再问用户）。"""
     logger.debug(f"clarify_node resolved_query='{state.get('resolved_query', '')}'")
     query = state.get("resolved_query", state["query"])
-    result = need_clarification(query)
+    findings = state.get("findings", [])
+    summaries = state.get("page_summaries", [])
+    search_context = ""
+    if findings:
+        sample = findings[:5]
+        search_context = "已获取的初步信息：\n" + "\n".join(
+            f"- {f.get('content', '')[:200]}" for f in sample
+        )
+    if summaries:
+        l0_lines = [s.get("l0_summary", "") for s in summaries if s.get("l0_summary")]
+        if l0_lines:
+            search_context += "\n\n页面摘要：\n" + "\n".join(f"- {l}" for l in l0_lines[:5])
+    result = need_clarification(query, preliminary_findings=search_context)
     return {
         "need_scope": result.get("need_scope", False),
         "scope": {
             "suggested_dimensions": result.get("suggested_dimensions", []),
             "need_hitl": result.get("need_scope", False),
         },
+        "_clarify_done": True,
     }
 
 
@@ -270,25 +294,28 @@ def search_node(state: AgentState) -> dict[str, Any]:
     sub_queries = state.get("sub_queries", [state.get("resolved_query", state["query"])])
     all_results: list[dict[str, Any]] = []
     
-    try:
-        for sq in sub_queries:
+    def _search_one(sq: str) -> list[dict[str, Any]]:
+        items = _searcher.search(sq, num_results=3)
+        return [
+            {"title": r.title, "url": r.url, "snippet": r.snippet, "query": sq}
+            for r in items
+        ]
+    
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        fut_map = {pool.submit(_search_one, sq): sq for sq in sub_queries}
+        for future in as_completed(fut_map):
+            sq = fut_map[future]
             try:
-                items = _searcher.search(sq, num_results=5)
-                all_results.extend([
-                    {"title": r.title, "url": r.url, "snippet": r.snippet, "query": sq}
-                    for r in items
-                ])
+                all_results.extend(future.result())
             except RuntimeError as e:
                 logger.warning(f"搜索失败 query='{sq}': {e}")
                 continue
-    except Exception as e:
-        logger.warning(f"搜索异常: {e}")
     
     if not all_results:
         fallback_query = state.get("resolved_query", state["query"])
         logger.warning(f"所有 sub_queries 都失败，fallback 到原始 query='{fallback_query}'")
         try:
-            items = _searcher.search(fallback_query, num_results=5)
+            items = _searcher.search(fallback_query, num_results=3)
             all_results.extend([
                 {"title": r.title, "url": r.url, "snippet": r.snippet, "query": fallback_query}
                 for r in items
@@ -311,7 +338,7 @@ _scraper: Scraper | None = None
 
 
 def scrape_node(state: AgentState) -> dict[str, Any]:
-    """抓取搜索结果中的网页。"""
+    """抓取搜索结果中的网页。抓取失败时 fallback 到 search snippet。"""
     logger.debug(f"scrape_node results_count={len(state.get('search_results', []))}")
     global _scraper
     if _scraper is None:
@@ -320,79 +347,118 @@ def scrape_node(state: AgentState) -> dict[str, Any]:
     results = state.get("search_results", [])
     urls = list(dict.fromkeys(r["url"] for r in results if r.get("url")))
     
-    scraped: list[dict[str, Any]] = []
-    for url in urls[:10]:  # 最多抓取 10 个
-        page = _scraper.scrape(url)
-        scraped.append({
-            "url": page.url,
-            "title": page.title,
-            "content": page.content,
-            "success": page.success,
-            "error": page.error,
-        })
-        # 更新信誉
-        update_source_credibility(url, page.success)
+    # 建立 url → snippet 映射
+    snippet_map = {r["url"]: r.get("snippet", "") for r in results if r.get("url")}
     
+    def _scrape_one(url: str) -> dict[str, Any]:
+        page = _scraper.scrape(url)
+        update_source_credibility(url, page.success)
+        if not page.success:
+            snippet = snippet_map.get(url, "")
+            if snippet:
+                logger.info(f"抓取失败但使用 search snippet 降级 url={url}")
+                return {
+                    "url": url, "title": page.title or url,
+                    "content": snippet, "success": True, "error": page.error,
+                }
+            logger.warning(f"抓取失败且无 snippet 降级 url={url}: {page.error}")
+            return {
+                "url": url, "title": page.title or "",
+                "content": "", "success": False, "error": page.error,
+            }
+        return {
+            "url": page.url, "title": page.title,
+            "content": page.content, "success": True, "error": "",
+        }
+
+    scraped: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        fut_map = {pool.submit(_scrape_one, url): url for url in urls[:5]}
+        for future in as_completed(fut_map):
+            scraped.append(future.result())
+
+    scrape_errors = sum(1 for s in scraped if not s["success"])
+    logger.info(f"scrape_node: 共 {len(scraped)} 页，失败 {scrape_errors} 页（已 fallback {len(scraped) - scrape_errors} 页）")
     return {"scraped_pages": scraped}
 
 
 # ── Node 8: context_mgr ─────────────────────────────────────────────
 
 def context_mgr_node(state: AgentState) -> dict[str, Any]:
-    """上下文管理：提取 L1/L0 并检查同话题重复。"""
+    """上下文管理：提取 L1/L0 并检查同话题重复。跳过过短页面。"""
     logger.debug(f"context_mgr_node scraped_pages={len(state.get('scraped_pages', []))}")
     pages = state.get("scraped_pages", [])
     new_summaries: list[dict[str, Any]] = []
-    
-    for page in pages:
+
+    def _extract_page(page: dict) -> dict | None:
         if not page.get("success") or not page.get("content"):
-            continue
-        extracted = extract_from_content(page.get("title", ""), page["content"])
-        new_summaries.append({
+            return None
+        content = page["content"]
+        if len(content) < 100:
+            logger.debug(f"跳过过短页面 url={page['url']} len={len(content)}")
+            return None
+        extracted = extract_from_content(page.get("title", ""), content)
+        return {
             "url": page["url"],
             "title": page.get("title", ""),
             "topic": "",
             "l1_content": json.dumps(extracted.get("findings", []), ensure_ascii=False),
             "l0_summary": extracted.get("l0_summary", ""),
             "findings": extracted.get("findings", []),
-        })
-    
+        }
+
+    eligible = [p for p in pages if p.get("success") and p.get("content") and len(p["content"]) >= 100]
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        fut_map = {pool.submit(_extract_page, p): p for p in eligible}
+        for future in as_completed(fut_map):
+            result = future.result()
+            if result:
+                new_summaries.append(result)
+
     return {"page_summaries": state.get("page_summaries", []) + new_summaries}
 
 
 # ── Node 9: dedup ──────────────────────────────────────────────────
 
-def dedup_node(state: AgentState) -> dict[str, Any]:
-    """对页面摘要中的发现去重。"""
-    logger.debug(f"dedup_node summaries={len(state.get('page_summaries', []))}")
+def dedup_rerank_node(state: AgentState) -> dict[str, Any]:
+    """合并去重+重排：先 dedup 再 rerank，减少一次 state 读写。"""
+    logger.debug(f"dedup_rerank_node summaries={len(state.get('page_summaries', []))}")
     summaries = state.get("page_summaries", [])
-    all_findings: list[dict[str, Any]] = []
-    
-    for s in summaries:
-        for f in s.get("findings", []):
+    batch: list[str] = []
+    batch_meta: list[tuple[int, int]] = []
+
+    for si, s in enumerate(summaries):
+        for fi, f in enumerate(s.get("findings", [])):
             content = f.get("content", "")
             if not content:
                 continue
-            check = dedup_check(content)
-            if not check["is_duplicate"]:
-                f["source_url"] = s.get("url", "")
-                all_findings.append(f)
-    
+            batch.append(content)
+            batch_meta.append((si, fi))
+
+    if not batch:
+        merged = state.get("findings", [])
+        return {"findings": merged}
+
+    # 批量嵌入（单次模型推理）
+    embeddings = embed_text(batch)
+
+    all_findings: list[dict[str, Any]] = []
+    for i, (si, fi) in enumerate(batch_meta):
+        emb = embeddings[i]
+        results = search_memory_by_vector(emb, limit=1, min_score=0.88)
+        if not results:
+            f = summaries[si]["findings"][fi]
+            f["source_url"] = summaries[si].get("url", "")
+            all_findings.append(f)
+
     existing = state.get("findings", [])
-    return {"findings": existing + all_findings}
+    merged = existing + all_findings
 
-
-# ── Node 10: rerank ────────────────────────────────────────────────
-
-def rerank_node(state: AgentState) -> dict[str, Any]:
-    """用 bge-reranker 对发现重排序。"""
-    logger.debug(f"rerank_node findings={len(state.get('findings', []))}")
     query = state.get("resolved_query", state["query"])
-    findings = state.get("findings", [])
-    if findings:
-        ranked = rank_findings(query, findings)
+    if merged:
+        ranked = rank_findings(query, merged, top_k=15)
         return {"findings": ranked}
-    return {}
+    return {"findings": merged}
 
 
 # ── Node 11: assess ─────────────────────────────────────────────────
@@ -435,43 +501,82 @@ def assess_node(state: AgentState) -> dict[str, Any]:
     conflict_description = result.get("conflict_description", "")
 
     if has_conflict and findings:
-        logger.info("检测到信息冲突，尝试实时抓取原文进行二次裁决")
-        conflict_urls = list(set(f.get("source_url", "") for f in findings if f.get("source_url")))
-        if conflict_urls:
-            try:
-                from src.search.scraper import Scraper
-                scraper = Scraper()
-                conflict_contents = []
-                for url in conflict_urls[:3]:
-                    try:
-                        page = scraper.scrape(url)
-                        if page.success and page.content:
-                            conflict_contents.append(f"来源: {url}\n标题: {page.title}\n内容:\n{page.content[:2000]}")
-                    except Exception:
-                        logger.warning(f"冲突源抓取失败: {url}")
-                if conflict_contents:
-                    conflict_context = "\n\n---\n\n".join(conflict_contents)
-                    resolve_result = chat_json([
-                        {"role": "system", "content": "你是一个事实核查专家。根据多个来源的原文内容，判断哪个说法更可信，裁决矛盾。"},
-                        {"role": "user", "content": f"""用户查询：{query}
+        logger.info("检测到信息冲突，尝试带可信度打分的自动裁决")
+        # 收集各冲突方的来源可信度
+        conflict_findings = []
+        seen_urls = set()
+        for f in findings:
+            url = f.get("source_url", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                cred = get_credibility(url) if url else None
+                score = cred["score"] if cred else 50
+                tag = get_source_tag(url) if url else "未知"
+                conflict_findings.append({
+                    "content": f.get("content", ""),
+                    "url": url,
+                    "credibility_score": score,
+                    "credibility_tag": tag,
+                })
+        try:
+            from src.search.scraper import Scraper
+            scraper = Scraper()
+            conflict_contents = []
+            for cf in conflict_findings[:3]:
+                url = cf["url"]
+                try:
+                    page = scraper.scrape(url)
+                    if page.success and page.content:
+                        conflict_contents.append(
+                            f"来源: {url}\n"
+                            f"可信度: {cf['credibility_score']}/100（{cf['credibility_tag']}）\n"
+                            f"标题: {page.title}\n"
+                            f"内容:\n{page.content[:2000]}"
+                        )
+                    else:
+                        conflict_contents.append(
+                            f"来源: {url}\n"
+                            f"可信度: {cf['credibility_score']}/100（{cf['credibility_tag']}）\n"
+                            f"（原文抓取失败，使用摘要信息）\n"
+                            f"{cf['content'][:500]}"
+                        )
+                except Exception:
+                    logger.warning(f"冲突源抓取失败: {url}")
+                    conflict_contents.append(
+                        f"来源: {url}\n"
+                        f"可信度: {cf['credibility_score']}/100（{cf['credibility_tag']}）\n"
+                        f"{cf['content'][:500]}"
+                    )
+            if conflict_contents:
+                conflict_context = "\n\n---\n\n".join(conflict_contents)
+                resolve_result = chat_json([
+                    {"role": "system", "content": "你是一个事实核查专家。根据可信度评分和多方来源原文进行综合裁决。"},
+                    {"role": "user", "content": f"""用户查询：{query}
 冲突描述：{conflict_description}
 
-各来源原文：
+各来源原文及可信度：
 {conflict_context}
 
-请判断哪个结论是正确的，或者是否需要更多信息。返回 JSON：
-{{"conclusion": "你的裁决结论", "reason": "为什么选这个", "has_conflict": false}}
-如果无法裁决，返回 {{"has_conflict": true, "reason": "..."}}"""},
-                    ])
-                    if not resolve_result.get("has_conflict", True):
-                        logger.info("冲突已通过原文核实解决")
-                        has_conflict = False
-                        conflict_description = resolve_result.get("conclusion", "")
-            except Exception:
-                logger.exception("冲突裁决失败，保持原冲突状态")
+裁决流程：
+1. 对比各来源的可信度评分和权威性
+2. 对比各来源的内容一致性和逻辑合理性
+3. 优先采信可信度高、有数据支撑、逻辑自洽的来源
+4. 给出推荐结论和置信度
+
+返回 JSON：
+{{"conclusion": "裁决结论", "reason": "推理过程（含可信度对比）", "confidence": 0-100, "has_conflict": false}}
+如果无法裁决，返回 {{"has_conflict": true, "reason": "无法裁决的原因", "confidence": 0}}"""},
+                ])
+                if not resolve_result.get("has_conflict", True):
+                    logger.info(f"冲突已自动解决（置信度={resolve_result.get('confidence', 0)}）")
+                    has_conflict = False
+                    conflict_description = resolve_result.get("conclusion", "")
+        except Exception:
+            logger.exception("冲突裁决失败，保持原冲突状态")
 
     return {
         "sufficient": result.get("sufficient", True),
+        "coverage_score": result.get("coverage_score", 0),
         "has_conflict": has_conflict,
         "conflict_description": conflict_description,
         "sub_queries": new_sub if new_sub else state.get("sub_queries", []),
@@ -567,7 +672,8 @@ async def report_node(state: AgentState) -> dict[str, Any]:
 
     footnotes = _build_footnotes(state)
 
-    result = await generate_report_stream(query, outline, findings, on_token=None)
+    cb = stream_callback_var.get()
+    result = await generate_report_stream(query, outline, findings, on_token=cb)
     report = result.get("report", "")
     if footnotes:
         report += footnotes
@@ -665,7 +771,7 @@ def memory_node(state: AgentState) -> dict[str, Any]:
                     level="L2",
                     content=snippet,
                     source_url=p.get("url", ""),
-                    topic=p.get("title", ""),
+                    topic=(p.get("title", "") or "")[:255],
                     embedding=None,
                 )
             except Exception:
@@ -729,46 +835,50 @@ def hitl_scope_node(state: AgentState) -> dict[str, Any]:
     """HITL 范围选择 — 中断等待用户选择调研维度。"""
     logger.debug(f"hitl_scope_node session_id='{state['session_id']}'")
     dimensions = state.get("scope", {}).get("suggested_dimensions", [])
-    interrupt({
+    resume_data = interrupt({
         "mode": "scope_select",
         "session_id": state["session_id"],
         "options": {"dimensions": dimensions},
     })
-    return {"need_scope": False}
+    selected = resume_data.get("selectedDimensions", []) if isinstance(resume_data, dict) else []
+    return {"need_scope": False, "selected_dimensions": selected}
 
 
 def hitl_adjust_node(state: AgentState) -> dict[str, Any]:
     """HITL 方向微调 — 中断等待用户调整搜索方向。"""
     logger.debug(f"hitl_adjust_node session_id='{state['session_id']}'")
     sub_queries = state.get("sub_queries", [])
-    interrupt({
+    resume_data = interrupt({
         "mode": "direction_adjust",
         "session_id": state["session_id"],
         "options": {"sub_queries": sub_queries},
     })
-    return {"need_adjust": False}
+    selected = resume_data.get("selectedSubQueries", []) if isinstance(resume_data, dict) else []
+    return {"need_adjust": False, "sub_queries": selected if selected else sub_queries}
 
 
 def hitl_conflict_node(state: AgentState) -> dict[str, Any]:
     """HITL 冲突采信 — 中断等待用户选择采信哪方观点。"""
     logger.debug(f"hitl_conflict_node session_id='{state['session_id']}'")
-    interrupt({
+    resume_data = interrupt({
         "mode": "conflict_resolve",
         "session_id": state["session_id"],
         "options": {"conflict": state.get("conflict_description", "")},
     })
-    return {"has_conflict": False}
+    choice = resume_data.get("selectedChoice", "") if isinstance(resume_data, dict) else ""
+    return {"has_conflict": False, "conflict_resolution": choice}
 
 
 def hitl_outline_node(state: AgentState) -> dict[str, Any]:
     """HITL 大纲微调 — 中断等待用户调整报告大纲。"""
     logger.debug(f"hitl_outline_node session_id='{state['session_id']}'")
-    interrupt({
+    resume_data = interrupt({
         "mode": "outline_edit",
         "session_id": state["session_id"],
         "options": {"outline": state.get("outline", [])},
     })
-    return {"need_outline_review": False}
+    outline = resume_data.get("outline", "") if isinstance(resume_data, dict) else ""
+    return {"need_outline_review": False, "outline": outline}
 
 
 # ── 路由函数 ─────────────────────────────────────────────────────────
@@ -786,23 +896,27 @@ def route_by_intent(state: AgentState) -> str:
 
 
 def route_after_rerank(state: AgentState) -> str:
-    """rerank 后根据 intent 分叉。"""
+    """rerank 后根据 intent 和阶段分叉。"""
     intent = state.get("intent", "")
-    logger.debug(f"route_after_rerank intent={intent}")
+    logger.debug(f"route_after_rerank intent={intent} clarify_done={state.get('_clarify_done', False)}")
     if intent == "refine_section":
         return "synthesize"
+    # deep_research / new_search_topic: 首次搜索后先去 clarify（有搜索结果支撑），后续循环直接 assess
+    if not state.get("_clarify_done", False):
+        return "clarify"
     return "assess"
 
 
 def route_assess(state: AgentState) -> str:
-    """assess 后决定：信息不足→回搜索，有冲突→HITL，足够→综合。"""
-    sufficient = state.get("sufficient", True)
+    """assess 后决定：覆盖率不足→回搜索，有冲突→HITL，足够→综合。
+   动态阈值：覆盖率 < 70 且轮次 < 5 继续搜索，否则进入综合。"""
+    coverage_score = state.get("coverage_score", 0)
     deep_count = state.get("deep_search_count", 0)
     has_conflict = state.get("has_conflict", False)
-    logger.debug(f"route_assess sufficient={sufficient} deep_count={deep_count} has_conflict={has_conflict}")
+    logger.debug(f"route_assess coverage_score={coverage_score} deep_count={deep_count} has_conflict={has_conflict}")
 
-    if not sufficient and deep_count < 2:
-        return "search"
     if has_conflict:
         return "hitl_conflict"
+    if coverage_score < 70 and deep_count < 2:
+        return "search"
     return "synthesize"

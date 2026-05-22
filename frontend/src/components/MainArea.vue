@@ -2,7 +2,7 @@
 import { watch, ref } from 'vue'
 import { useSessionStore } from '../stores/sessionStore'
 import { useChatStore } from '../stores/chatStore'
-import { fetchHistory } from '../api'
+import { fetchHistory, cancelResearch } from '../api'
 import ChatHistory from './ChatHistory.vue'
 import QueryInput from './QueryInput.vue'
 import type { useHITL } from '../composables/useHITL'
@@ -29,7 +29,10 @@ function loadReport(report: string | null) {
 
 watch(() => sessionStore.currentSessionId, async (id, oldId) => {
   if (!id) return
-  if (oldId) queryInputRef.value?.abort()
+  if (oldId) {
+    queryInputRef.value?.abort()
+    cancelResearch(oldId).catch(() => {})
+  }
   chatStore.reset()
   try {
     const data = await fetchHistory(id)

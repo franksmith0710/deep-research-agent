@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -35,19 +34,6 @@ def close_pool() -> None:
         _pool.closeall()
         _pool = None
         logger.info("PostgreSQL pool closed")
-
-
-@asynccontextmanager
-async def get_conn():
-    if _pool is None:
-        init_pool()
-    conn = _pool.getconn()
-    try:
-        yield conn
-        _pool.putconn(conn)
-    except Exception:
-        _pool.putconn(conn)
-        raise
 
 
 def _dict_row(cursor: psycopg2.extensions.cursor) -> dict[str, Any] | None:

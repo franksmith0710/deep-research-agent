@@ -38,6 +38,15 @@ _research_locks: dict[str, asyncio.Lock] = {}
 # 正在 resume 中的会话，防止并发重复 resume
 _resuming_sessions: set[str] = set()
 
+# HITL 超时（秒）
+_HITL_TIMEOUT = 600
+
+# HITL 超时清理任务
+_hitl_cleanup_tasks: dict[str, asyncio.Task] = {}
+
+# 运行中的 agent 任务（用于取消）
+_running_tasks: dict[str, asyncio.Task] = {}
+
 
 def get_graph():
     global _graph
@@ -61,8 +70,7 @@ _NODE_DESCRIPTIONS = {
     "search": "正在搜索相关信息...",
     "scrape": "正在抓取网页内容",
     "context_mgr": "正在整理提炼内容",
-    "dedup": "正在去重检查",
-    "rerank": "正在排序筛选",
+    "dedup_rerank": "正在去重排序",
     "assess": "正在评估覆盖度",
     "synthesize": "正在综合生成内容",
     "report": "正在生成研究报告",
@@ -85,22 +93,6 @@ def _detect_interrupt(node_output: Any) -> dict | None:
             if hasattr(int_item, "value"):
                 return int_item.value
     return None
-
-
-def _push_final_events(sse: SSEManager, final_data: dict[str, Any], is_first: bool) -> None:
-    """推送最终报告/章节事件，确保 text/patch 互斥。"""
-    report = final_data.get("report", "")
-    sections = final_data.get("sections", {})
-
-    if is_first:
-        if report:
-            return report
-    else:
-        for section_name, section_content in sections.items():
-            if section_content:
-                return None  # Will send patch
-
-    return report
 
 
 @router.on_event("startup")
@@ -166,7 +158,9 @@ async def start_research(req: ResearchRequest):
         state["outline"] = ctx["outline"]
         state["deep_search_count"] = ctx["deep_search_count"]
 
-    asyncio.create_task(_run_agent(state, sse, lock, ctx))
+    task = asyncio.create_task(_run_agent(state, sse, lock, ctx))
+    _running_tasks[req.session_id] = task
+    task.add_done_callback(lambda t: _running_tasks.pop(req.session_id, None))
 
     return sse.get_response()
 
@@ -175,6 +169,18 @@ async def _stream_text(sse: SSEManager, text: str, chunk_size: int = 100, delay:
     for i in range(0, len(text), chunk_size):
         await sse.put_text(text[i:i + chunk_size])
         await asyncio.sleep(delay)
+
+
+async def _cleanup_hitl_timeout(session_id: str, delay: int) -> None:
+    """HITL 超时后自动清理泄漏的资源。"""
+    await asyncio.sleep(delay)
+    data = _interrupted_sessions.pop(session_id, None)
+    _hitl_cleanup_tasks.pop(session_id, None)
+    if data:
+        lock = data.get("lock")
+        if lock and lock.locked():
+            lock.release()
+        logger.warning(f"HITL session {session_id} timed out after {delay}s, cleaned up")
 
 
 async def _run_agent(state: dict[str, Any], sse: SSEManager, lock: asyncio.Lock, ctx: dict[str, Any] | None):
@@ -213,6 +219,8 @@ async def _run_agent(state: dict[str, Any], sse: SSEManager, lock: asyncio.Lock,
                         options=payload.get("options", {}),
                     )
                     hitl_triggered = True
+                    t = asyncio.create_task(_cleanup_hitl_timeout(session_id, _HITL_TIMEOUT))
+                    _hitl_cleanup_tasks[session_id] = t
                     return
 
             for node_name, node_output in event.items():
@@ -228,6 +236,8 @@ async def _run_agent(state: dict[str, Any], sse: SSEManager, lock: asyncio.Lock,
                             options=interrupt_data.get("options", {}),
                         )
                         hitl_triggered = True
+                        t = asyncio.create_task(_cleanup_hitl_timeout(session_id, _HITL_TIMEOUT))
+                        _hitl_cleanup_tasks[session_id] = t
                         return
                     await _put_readable_chain(sse, node_name)
 
@@ -241,7 +251,7 @@ async def _run_agent(state: dict[str, Any], sse: SSEManager, lock: asyncio.Lock,
         logger.info(f"Agent run completed session_id={session_id}")
 
         if is_first:
-            if report:
+            if report and not report_streamed:
                 await _stream_text(sse, report)
         else:
             for section_name, section_content in sections.items():
@@ -250,6 +260,9 @@ async def _run_agent(state: dict[str, Any], sse: SSEManager, lock: asyncio.Lock,
             if report and not report_streamed:
                 await _stream_text(sse, report)
 
+    except asyncio.CancelledError:
+        logger.warning(f"Agent cancelled session_id={session_id}")
+        await sse.put_chain("action_result", "cancelled", "研究已取消")
     except Exception as e:
         logger.error(f"Agent run failed session_id={session_id}: {e}")
         await sse.put_chain("action_result", "error", f"研究过程出错: {e}")
@@ -260,6 +273,20 @@ async def _run_agent(state: dict[str, Any], sse: SSEManager, lock: asyncio.Lock,
             _interrupted_sessions.pop(session_id, None)
             if lock.locked():
                 lock.release()
+
+
+@router.post("/api/research/{session_id}/cancel")
+async def cancel_research(session_id: str):
+    """取消正在运行的研究任务。"""
+    cancel_task = _hitl_cleanup_tasks.pop(session_id, None)
+    if cancel_task:
+        cancel_task.cancel()
+    task = _running_tasks.pop(session_id, None)
+    if task:
+        task.cancel()
+        logger.info(f"Research cancelled session_id={session_id}")
+        return {"status": "cancelled"}
+    return {"status": "no_task"}
 
 
 @router.post("/api/hitl/callback")
@@ -282,9 +309,14 @@ async def hitl_callback(req: HITLRequest):
         logger.warning(f"Session {req.session_id} 正在 resume 中，忽略重复 HITL 回调")
         return {"status": "skipped", "session_id": req.session_id, "mode": req.mode.value, "reason": "会话正在处理中"}
 
+    cancel_task = _hitl_cleanup_tasks.pop(req.session_id, None)
+    if cancel_task:
+        cancel_task.cancel()
     _resuming_sessions.add(req.session_id)
     ctx = session_data.get("ctx")
-    asyncio.create_task(_resume_agent(sse, config, ctx, req.data, lock, req.session_id))
+    task = asyncio.create_task(_resume_agent(sse, config, ctx, req.data, lock, req.session_id))
+    _running_tasks[req.session_id] = task
+    task.add_done_callback(lambda t: _running_tasks.pop(req.session_id, None))
 
     return {"status": "resumed", "session_id": req.session_id, "mode": req.mode.value}
 
@@ -294,6 +326,7 @@ async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, 
     if session_id is None:
         session_id = config["configurable"]["thread_id"]
     logger.info(f"Resuming agent session_id={session_id} resume_data={resume_data}")
+    stream_callback_var.set(lambda token: asyncio.create_task(sse.put_text(token)))
     graph = get_graph()
     is_first = ctx is None
 
@@ -312,6 +345,8 @@ async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, 
                         options=payload.get("options", {}),
                     )
                     hitl_triggered = True
+                    t = asyncio.create_task(_cleanup_hitl_timeout(session_id, _HITL_TIMEOUT))
+                    _hitl_cleanup_tasks[session_id] = t
                     return
 
             for node_name, node_output in event.items():
@@ -327,6 +362,8 @@ async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, 
                             options=interrupt_data.get("options", {}),
                         )
                         hitl_triggered = True
+                        t = asyncio.create_task(_cleanup_hitl_timeout(session_id, _HITL_TIMEOUT))
+                        _hitl_cleanup_tasks[session_id] = t
                         return
 
         final = graph.get_state(config)
@@ -339,7 +376,7 @@ async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, 
         logger.info(f"Agent resume completed session_id={session_id}")
 
         if is_first:
-            if report:
+            if report and not report_streamed:
                 await _stream_text(sse, report)
         else:
             for section_name, section_content in sections.items():
@@ -348,6 +385,8 @@ async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, 
             if report and not report_streamed:
                 await _stream_text(sse, report)
 
+    except asyncio.CancelledError:
+        logger.warning(f"Agent resume cancelled session_id={session_id}")
     except Exception as e:
         logger.error(f"Agent resume failed session_id={session_id}: {e}")
         await sse.put_chain("action_result", "error", f"研究过程出错: {e}")
@@ -355,6 +394,7 @@ async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, 
         _resuming_sessions.discard(session_id)
         if not hitl_triggered:
             _interrupted_sessions.pop(session_id, None)
-        await sse.put_done()
-        if lock and lock.locked():
-            lock.release()
+            await sse.put_done()
+            if lock and lock.locked():
+                lock.release()
+        stream_callback_var.set(None)

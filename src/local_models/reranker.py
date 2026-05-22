@@ -16,7 +16,7 @@ def get_reranker() -> CrossEncoder:
         logger.debug("Loading BGE reranker model")
         _model = CrossEncoder(
             settings.bge_reranker_path,
-            device="cpu",
+            device="cuda",
         )
         logger.debug("BGE reranker model loaded")
     return _model

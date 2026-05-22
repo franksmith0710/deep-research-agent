@@ -14,7 +14,7 @@ class DuckDuckGoSearch(SearchEngine):
     def __init__(self, timeout: float = 15.0) -> None:
         self._timeout = timeout
 
-    def search(self, query: str, num_results: int = 10) -> list[SearchResultItem]:
+    def search(self, query: str, num_results: int = 3) -> list[SearchResultItem]:
         logger.debug(f"DDGS search query='{query}' num={num_results}")
         try:
             with ddgs.DDGS(timeout=self._timeout) as d:
