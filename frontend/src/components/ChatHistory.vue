@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { watch, ref, nextTick } from 'vue'
+import { watch, ref, nextTick, shallowRef } from 'vue'
 import { marked } from 'marked'
 import { useChatStore } from '../stores/chatStore'
 
@@ -7,11 +7,27 @@ const chatStore = useChatStore()
 const container = ref<HTMLElement>()
 const showHistory = ref(false)
 
+let rafId = 0
+const throttledScroll = shallowRef(0)
+
 function render(md: string) {
-  return marked.parse(md || '') as string
+  try {
+    return marked.parse(md || '') as string
+  } catch {
+    return md || ''
+  }
 }
 
-watch([() => chatStore.messages.length, () => chatStore.streamingText, () => chatStore.chainEvents.length], async () => {
+watch(() => chatStore.streamingText, () => {
+  if (!rafId) {
+    rafId = requestAnimationFrame(() => {
+      rafId = 0
+      throttledScroll.value++
+    })
+  }
+})
+
+watch([() => chatStore.messages.length, throttledScroll, () => chatStore.chainEvents.length], async () => {
   await nextTick()
   if (container.value) {
     container.value.scrollTop = container.value.scrollHeight

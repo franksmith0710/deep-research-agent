@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"
 
+    metaso_api_key: str = ""
+
     langchain_tracing_v2: bool = True
     langchain_api_key: str | None = None
     langchain_project: str = "search_agent"

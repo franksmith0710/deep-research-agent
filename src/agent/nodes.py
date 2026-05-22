@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.llm.client import chat, chat_json
 from src.api.contexts import stream_callback_var
 from src.planner.planner import resolve_query, need_clarification, generate_sub_queries
-from src.search.duckduckgo import DuckDuckGoSearch
+from src.search.metaso import MetasoSearch
 from src.search.scraper import Scraper
 from src.extract.extractor import extract_from_content
 from src.synthesize.deduplicator import dedup_check
@@ -36,6 +36,9 @@ from src.db.postgres import (
 )
 
 from src.local_models.embedder import embed_text
+
+import torch
+import torch.nn.functional as F
 
 _INTENT_PROMPT = """你是一个意图分类器。分析用户查询和已有报告上下文，判断用户意图。
 
@@ -281,7 +284,7 @@ def planner_node(state: AgentState) -> dict[str, Any]:
 
 # ── Node 6: search ──────────────────────────────────────────────────
 
-_searcher: DuckDuckGoSearch | None = None
+_searcher: MetasoSearch | None = None
 
 
 def search_node(state: AgentState) -> dict[str, Any]:
@@ -289,7 +292,7 @@ def search_node(state: AgentState) -> dict[str, Any]:
     logger.debug(f"search_node sub_queries={state.get('sub_queries', [])}")
     global _searcher
     if _searcher is None:
-        _searcher = DuckDuckGoSearch()
+        _searcher = MetasoSearch()
     
     sub_queries = state.get("sub_queries", [state.get("resolved_query", state["query"])])
     all_results: list[dict[str, Any]] = []
@@ -442,16 +445,27 @@ def dedup_rerank_node(state: AgentState) -> dict[str, Any]:
     # 批量嵌入（单次模型推理）
     embeddings = embed_text(batch)
 
+    existing = state.get("findings", [])
+    existing_batch = [f.get("content", "") for f in existing if f.get("content")]
+    existing_embs = embed_text(existing_batch) if existing_batch else []
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
     all_findings: list[dict[str, Any]] = []
     for i, (si, fi) in enumerate(batch_meta):
         emb = embeddings[i]
         results = search_memory_by_vector(emb, limit=1, min_score=0.88)
-        if not results:
-            f = summaries[si]["findings"][fi]
-            f["source_url"] = summaries[si].get("url", "")
-            all_findings.append(f)
+        if results:
+            continue
+        # 跨轮次去重：检查与当前 session 已有 findings 的语义相似度
+        if existing_embs:
+            emb_t = torch.tensor(emb, device=device).unsqueeze(0)
+            existing_t = torch.tensor(existing_embs, device=device)
+            if (F.cosine_similarity(emb_t, existing_t).max().item() >= 0.88):
+                continue
+        f = summaries[si]["findings"][fi]
+        f["source_url"] = summaries[si].get("url", "")
+        all_findings.append(f)
 
-    existing = state.get("findings", [])
     merged = existing + all_findings
 
     query = state.get("resolved_query", state["query"])
@@ -478,6 +492,7 @@ def assess_node(state: AgentState) -> dict[str, Any]:
             "has_conflict": False,
             "_llm_fallback": True,
             "sub_queries": state.get("sub_queries", []),
+            "assess_round": state.get("assess_round", 0) + 1,
         }
     
     dimensions = list(set(f.get("topic", "") for f in findings if f.get("topic")))
@@ -580,6 +595,7 @@ def assess_node(state: AgentState) -> dict[str, Any]:
         "has_conflict": has_conflict,
         "conflict_description": conflict_description,
         "sub_queries": new_sub if new_sub else state.get("sub_queries", []),
+        "assess_round": state.get("assess_round", 0) + 1,
     }
 
 
@@ -786,7 +802,7 @@ def memory_node(state: AgentState) -> dict[str, Any]:
 
     # 写聊天记录
     try:
-        insert_chat_message(state["session_id"], "assistant", state.get("report", "")[:500])
+        insert_chat_message(state["session_id"], "assistant", state.get("report", ""))
     except Exception:
         logger.exception("memory_node chat history write failed")
 
@@ -823,7 +839,7 @@ def simple_llm_node(state: AgentState) -> dict[str, Any]:
 def memory_llm_node(state: AgentState) -> dict[str, Any]:
     """轻量版记忆持久化：chat_history + query+回答写入 L1。"""
     try:
-        insert_chat_message(state["session_id"], "assistant", state.get("report", "")[:500])
+        insert_chat_message(state["session_id"], "assistant", state.get("report", ""))
     except Exception:
         logger.exception("memory_llm_node chat history failed")
     return {"status": "completed"}
@@ -909,14 +925,14 @@ def route_after_rerank(state: AgentState) -> str:
 
 def route_assess(state: AgentState) -> str:
     """assess 后决定：覆盖率不足→回搜索，有冲突→HITL，足够→综合。
-   动态阈值：覆盖率 < 70 且轮次 < 5 继续搜索，否则进入综合。"""
+   动态阈值：覆盖率 < 70 且轮次 < 3 继续搜索，否则进入综合。"""
     coverage_score = state.get("coverage_score", 0)
-    deep_count = state.get("deep_search_count", 0)
+    assess_round = state.get("assess_round", 0)
     has_conflict = state.get("has_conflict", False)
-    logger.debug(f"route_assess coverage_score={coverage_score} deep_count={deep_count} has_conflict={has_conflict}")
+    logger.debug(f"route_assess coverage_score={coverage_score} assess_round={assess_round} has_conflict={has_conflict}")
 
     if has_conflict:
         return "hitl_conflict"
-    if coverage_score < 70 and deep_count < 2:
+    if coverage_score < 70 and assess_round < 3:
         return "search"
     return "synthesize"

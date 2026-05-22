@@ -12,21 +12,6 @@ const sessionStore = useSessionStore()
 const chatStore = useChatStore()
 const queryInputRef = ref<{ abort: () => void }>()
 
-function loadReport(report: string | null) {
-  if (!report) return
-  const exists = chatStore.messages.some(
-    m => m.role === 'assistant' && m.content === report
-  )
-  if (!exists) {
-    chatStore.addMessage({
-      id: Date.now(),
-      role: 'assistant',
-      content: report,
-      created_at: new Date().toISOString(),
-    })
-  }
-}
-
 watch(() => sessionStore.currentSessionId, async (id, oldId) => {
   if (!id) return
   if (oldId) {
@@ -37,7 +22,6 @@ watch(() => sessionStore.currentSessionId, async (id, oldId) => {
   try {
     const data = await fetchHistory(id)
     chatStore.setMessages(data.messages || [])
-    loadReport(data.report)
   } catch { /* ignore */ }
 })
 </script>

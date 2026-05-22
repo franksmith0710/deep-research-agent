@@ -5,7 +5,7 @@ import json
 import time
 from typing import Any, AsyncGenerator
 
-from openai import OpenAI, AsyncOpenAI
+from langchain_openai import ChatOpenAI
 from openai import (
     APIError,
     APIConnectionError,
@@ -18,8 +18,8 @@ from src.logging_config import get_logger
 
 logger = get_logger("llm")
 
-_sync_client: OpenAI | None = None
-_async_client: AsyncOpenAI | None = None
+_sync_client: ChatOpenAI | None = None
+_async_client: ChatOpenAI | None = None
 
 
 async def chat_stream(
@@ -31,11 +31,7 @@ async def chat_stream(
     """流式调用 LLM，逐 token 产出。"""
     client = await get_async_client()
     kwargs: dict[str, Any] = {
-        "model": settings.deepseek_model,
-        "messages": messages,
         "timeout": timeout,
-        "temperature": 0.3,
-        "stream": True,
     }
 
     logger.debug(f"LLM stream start model={settings.deepseek_model} messages={len(messages)}")
@@ -44,10 +40,9 @@ async def chat_stream(
     for attempt in range(max_retries):
         try:
             start_time = time.time()
-            stream = await client.chat.completions.create(**kwargs)
-            async for chunk in stream:
+            async for chunk in client.astream(messages, **kwargs):
                 latency = time.time() - start_time
-                token = chunk.choices[0].delta.content or ""
+                token = chunk.content or ""
                 if token:
                     logger.debug(f"LLM stream token len={len(token)} latency={latency:.3f}s")
                     yield token
@@ -74,22 +69,28 @@ async def chat_stream(
     raise RuntimeError(f"LLM 流式调用失败（{max_retries} 次重试后）: {last_error}")
 
 
-def get_sync_client() -> OpenAI:
+def get_sync_client() -> ChatOpenAI:
     global _sync_client
     if _sync_client is None:
-        _sync_client = OpenAI(
-            api_key=settings.deepseek_api_key,
-            base_url=settings.deepseek_base_url,
+        _sync_client = ChatOpenAI(
+            model=settings.deepseek_model,
+            openai_api_key=settings.deepseek_api_key,
+            openai_api_base=settings.deepseek_base_url,
+            temperature=0.3,
+            streaming=False,
         )
     return _sync_client
 
 
-async def get_async_client() -> AsyncOpenAI:
+async def get_async_client() -> ChatOpenAI:
     global _async_client
     if _async_client is None:
-        _async_client = AsyncOpenAI(
-            api_key=settings.deepseek_api_key,
-            base_url=settings.deepseek_base_url,
+        _async_client = ChatOpenAI(
+            model=settings.deepseek_model,
+            openai_api_key=settings.deepseek_api_key,
+            openai_api_base=settings.deepseek_base_url,
+            temperature=0.3,
+            streaming=True,
         )
     return _async_client
 
@@ -107,10 +108,7 @@ def chat(
     """调用 DeepSeek Chat API，自动重试（最多 4 次）。"""
     client = get_sync_client()
     kwargs: dict[str, Any] = {
-        "model": settings.deepseek_model,
-        "messages": messages,
         "timeout": timeout,
-        "temperature": 0.3,
     }
     if response_format:
         kwargs["response_format"] = response_format
@@ -121,10 +119,10 @@ def chat(
     for attempt in range(max_retries):
         start_time = time.time()
         try:
-            resp = client.chat.completions.create(**kwargs)
+            resp = client.invoke(messages, **kwargs)
             latency = time.time() - start_time
-            if resp.choices:
-                content = resp.choices[0].message.content or ""
+            content = resp.content or ""
+            if content:
                 logger.debug(f"LLM response len={len(content)} latency={latency:.3f}s")
                 return content
             raise RuntimeError("LLM 返回空响应")

@@ -48,6 +48,7 @@ class AgentState(TypedDict):
     
     # 控制
     deep_search_count: int
+    assess_round: int  # assess 轮次计数器（用于跨 intent 循环终止）
     refine_section_name: str  # refine 路径指定章节
     
     # HITL 条件标记
@@ -89,6 +90,7 @@ def make_initial_state(
         "report": "",
         "sections": {},
         "deep_search_count": 0,
+        "assess_round": 0,
         "refine_section_name": "",
         "need_scope": False,
         "_clarify_done": False,

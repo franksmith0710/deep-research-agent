@@ -327,13 +327,18 @@ async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, 
         session_id = config["configurable"]["thread_id"]
     logger.info(f"Resuming agent session_id={session_id} resume_data={resume_data}")
     stream_callback_var.set(lambda token: asyncio.create_task(sse.put_text(token)))
+    callback_was_active = True
     graph = get_graph()
     is_first = ctx is None
 
     hitl_triggered = False
+    replayed_interrupt_skipped = False
     try:
         async for event in graph.astream(Command(resume=resume_data or {}), config):
             if "__interrupt__" in event:
+                if not replayed_interrupt_skipped:
+                    replayed_interrupt_skipped = True
+                    continue
                 items = event["__interrupt__"]
                 if items and len(items) > 0:
                     int_item = items[0]
@@ -376,13 +381,13 @@ async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, 
         logger.info(f"Agent resume completed session_id={session_id}")
 
         if is_first:
-            if report and not report_streamed:
+            if report and not report_streamed and not callback_was_active:
                 await _stream_text(sse, report)
         else:
             for section_name, section_content in sections.items():
                 if section_content:
                     await sse.put_patch(section_name, section_content, append=False)
-            if report and not report_streamed:
+            if report and not report_streamed and not callback_was_active:
                 await _stream_text(sse, report)
 
     except asyncio.CancelledError:

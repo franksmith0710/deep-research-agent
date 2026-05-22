@@ -17,7 +17,12 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   function addChainEvent(event: ChainEvent) {
-    allEvents.value.push(event)
+    const idx = allEvents.value.findIndex(e => e.node === event.node && e.type === event.type)
+    if (idx >= 0) {
+      allEvents.value[idx] = event
+    } else {
+      allEvents.value.push(event)
+    }
     currentEvent.value = event
   }
 
@@ -33,10 +38,9 @@ export const useChatStore = defineStore('chat', () => {
   function appendStream(chunk: string) {
     if (!isStreaming.value) {
       isStreaming.value = true
-      streamingText.value = chunk
-    } else {
-      streamingText.value += chunk
+      streamingText.value = ''
     }
+    streamingText.value += chunk
   }
 
   function finalizeStream() {
