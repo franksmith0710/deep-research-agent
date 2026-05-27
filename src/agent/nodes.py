@@ -1,11 +1,10 @@
-"""LangGraph 节点：15 个节点 + intent 4 分支逻辑 + 4 HITL 中断节点。"""
+"""LangGraph 节点：15 个节点 + intent 4 分支逻辑 + 3 HITL 中断节点。"""
 
 from __future__ import annotations
 
 import contextvars
 import json
 from typing import Any
-from urllib.parse import urlparse
 
 from langgraph.types import interrupt
 
@@ -20,25 +19,21 @@ from src.llm.client import chat, chat_json
 from src.api.contexts import stream_callback_var
 from src.planner.planner import resolve_query, need_clarification, generate_sub_queries
 from src.search.metaso import MetasoSearch
+from src.search.duckduckgo import DuckDuckGoSearch
 from src.search.scraper import Scraper
-from src.extract.extractor import extract_from_content
-from src.synthesize.deduplicator import dedup_check
+from src.page_brief.brief import brief_from_page
 from src.synthesize.ranker import rank_findings
-from src.synthesize.synthesizer import synthesize_section
+from src.local_models.reranker import rerank, release_gpu as _release_reranker
 from src.report.writer import generate_outline, generate_report_stream
 from src.memory.retriever import retrieve_l1
+from src.memory.updater import update_memory as memory_update
 from src.memory.credibility import update_source_credibility, get_credibility, get_source_tag
 from src.db.postgres import (
     update_task, insert_chat_message,
-    insert_memory, upsert_credibility, update_memory,
-    get_l2_by_url, get_recent_tasks_by_session,
-    search_memory_by_vector,
+    get_recent_tasks_by_session,
 )
-
-from src.local_models.embedder import embed_text
-
-import torch
-import torch.nn.functional as F
+from src.local_models.embedder import embed_text, release_gpu as _release_embedder
+from src.utils.dedup import max_cosine_similarity, SEMANTIC_DUP_THRESHOLD
 
 _INTENT_PROMPT = """你是一个意图分类器。分析用户查询和已有报告上下文，判断用户意图。
 
@@ -85,63 +80,100 @@ _CHECK_HISTORY_PROMPT = """你是一个记忆检索专家。根据用户查询�
 历史相关记忆：
 {memory_items}
 
-返回 JSON：{{"related_memories": [记忆ID列表], "summary": "历史信息摘要"}}
+返回 JSON：{{"related_indices": [条目索引, ...], "summary": "历史信息摘要"}}
 """
 
-_ASSESS_PROMPT = """你是一个研究覆盖度评估专家。判断当前收集的信息是否足够生成一份完整的报告，并给出信息覆盖率评分。
+_ASSESS_PROMPT = """你是研究覆盖度评估专家。请依次完成以下三个职责。
 
-当前进度：已完成 {search_count} 轮深度搜索
+## 职责一：大纲规划
+
+根据已有 findings 实际覆盖的维度生成 4-8 章大纲，每章 2-4 个要点。
+如果已有大纲，判断是否仍然合理；合理则复用，不合理才重写。
+**无论是否复用，都必须输出当前最合理的大纲。**
+
+## 职责二：量化覆盖度评估
+
+按以下四个维度计算总分（满分 100）。注意：每个维度的分数**必须从给定值中选择，不得使用其他数值**。
+
+① 用户问题匹配度 (0-30)
+判断 findings 整体上回答用户查询的完整度：
+- 查询所有关键方面都有直接回答 → 30
+- 主要方面已回答，少数细节点不足 → 20
+- 回答了部分方面，有明显缺口 → 10
+- 发现内容与查询关联度低 → 5
+**必须从 [30, 20, 10, 5] 中选择，不得使用其他数值。**
+
+② 内容-大纲匹配度 (0-25)
+逐章检查每一条 findings 是否支撑某一章节：
+- 统计**有直接支撑的章节数**（≥1 条相关 finding 即算），记作 covered
+- 统计总章节数，记作 total
+- 输出时不要自行计算分数，只需将 covered 章节数填入 score_detail.outline_covered，total 章节数填入 score_detail.outline_total
+- 路由将按公式计算：25 × outline_covered / outline_total
+
+③ 覆盖范围 (0-25)
+按 findings 去重后的独特 topic 维度数量：
+- ≥ 5 个独特维度 → 25
+- 3-4 个 → 15
+- 1-2 个 → 5
+**必须从 [25, 15, 5] 中选择，不得使用其他数值。**
+
+④ 来源可信度 (0-20)
+- ≥ 50% 来自高权威域名（学术/官方/主流媒体/行业权威）→ 20
+- ≥ 25% → 15
+- < 25% → 5
+**必须从 [20, 15, 5] 中选择，不得使用其他数值。**
+
+总分 = ① + ③ + ④ + (25 × covered / total)
+coverage_score = 总分
+sufficient = (总分 ≥ 60) 或 (当前轮次 ≥ 3)
+**如果轮次 ≥ 3，必须设置 sufficient=true。**
+
+## 职责三：缺口处理（仅在 sufficient=false 时执行）
+
+1. 定位缺口章节：在 gaps 中列出无直接支撑的章节名
+2. 优先翻查"已有已抓取页面概况"能否填补缺口：
+   - 能 → 填入 gap_fillable_pages，**info_needed 必须写具体缺失的信息方向（如"包含 ChatGPT 响应速度的评测数据"），不得写模糊描述**
+   - need_re_extract=true
+3. 无可用页面 → 为缺口章节生成 new_sub_queries（每章 1-2 条）
+
+## 当前输入
+
+已有大纲：
+{outline_text}
+
+当前轮次：第 {search_count} 轮（最多 3 轮）
 已收集发现数：{findings_count}
 覆盖的维度：{dimensions}
-L0 摘要列表：
-{l0_summaries}
 
-评分标准（覆盖率 0-100）：
-- 0-30：严重不足，大部分核心维度缺失
-- 31-50：部分覆盖，关键维度仍有缺口
-- 51-70：基本覆盖，但某些方面不够深入
-- 71-85：良好覆盖，主要维度有足够数据点
-- 86-100：全面覆盖，所有维度信息充分
+已有发现（详细内容）：
+{findings_detail}
 
-决策规则：
-- 覆盖率 < 70 → 需要继续搜索（返回 new_sub_queries）
-- 覆盖率 ≥ 70 → 信息足够，可以结束搜索
+已有已抓取页面概况：
+{pages}
 
 用户查询：{query}
 
-返回 JSON：{{
+## 输出 JSON 格式
+
+{{
+    "outline": [{{"section": "章节名", "points": ["要点1", ...]}}, ...],
     "coverage_score": 0-100,
+    "score_detail": {{
+        "query_match": ①分数,
+        "outline_covered": ②covered章节数,
+        "outline_total": ②总章节数,
+        "scope": ③分数,
+        "credibility": ④分数
+    }},
     "sufficient": true/false,
-    "reason": "...",
-    "missing_dimensions": ["..."],
-    "new_sub_queries": ["..."],
-    "has_conflict": true/false,
-    "conflict_description": "..."
+    "reason": "判断依据",
+    "gaps": ["缺口章节1", ...],
+    "gap_fillable_pages": [{{"url": "...", "info_needed": "具体缺失信息", "target_section": "..."}}],
+    "need_re_extract": true/false,
+    "new_sub_queries": ["搜索查询", ...],
+    "has_conflict": false,
+    "conflict_description": ""
 }}
-"""
-
-_MEMORY_NODE_PROMPT = """你是一个信息压缩专家。将本次研究的最新发现压缩为 L0 摘要（≤100 字）。
-
-最新发现列表：
-{new_findings}
-
-返回 JSON：{{"l0_summary": "..."}}
-"""
-
-_MEMORY_FILTER_PROMPT = """你是一个记忆质量评估专家。判断以下发现是否适合存入跨会话长期记忆。
-
-判断标准（满足任一即排除）：
-- ❌ 时效性信息：天气、股价、汇率、今日新闻、比赛比分、会议活动等，时间过去后价值归零
-- ❌ 碎片化：无具体数据、无结论、纯情绪表达
-- ❌ 重复内容：与已有发现高度重复
-- ✅ 适合：结构化事实、数据、观点、结论、政策、流程、教程等，跨时间仍有复用价值
-
-用户原始查询：{query}
-
-发现列表：
-{findings}
-
-返回 JSON：{{"keep_indices": [0, 2, ...], "reasons": {{"0": "时效性信息", "2": "高质量事实"}}}}
 """
 
 _ADJUST_PROMPT = """你是一个搜索规划专家。判断是否需要用户调整搜索方向。
@@ -196,17 +228,17 @@ def intent_classifier_node(state: AgentState) -> dict[str, Any]:
 # ── Node 3: check_history ────────────────────────────────────────────
 
 def check_history_node(state: AgentState) -> dict[str, Any]:
-    """检查历史记忆：检索 L1 相关记忆并合并到 findings。"""
+    """检查历史记忆：检索长期记忆（user/memories）并合并到 findings。"""
     logger.debug(f"check_history_node resolved_query='{state.get('resolved_query', '')}'")
     query = state.get("resolved_query", state["query"])
-    memories = retrieve_l1(query, limit=settings.memory_retrieval_limit, min_score=settings.memory_min_score)
+    memories = retrieve_l1(query, limit=settings.memory_retrieval_limit)
     existing = state.get("findings", [])
     if not memories:
         return {"findings": existing}
 
     memory_text = "\n".join(
-        f"[{m['id']}] {m.get('content', '')[:200]}"
-        for m in memories
+        f"[{i}] {m.get('content', '')[:200]}"
+        for i, m in enumerate(memories)
     )
     result = chat_json([
         {"role": "system", "content": "你是记忆检索专家。请用 JSON 格式回答。"},
@@ -214,19 +246,18 @@ def check_history_node(state: AgentState) -> dict[str, Any]:
             query=query, memory_items=memory_text
         )},
     ])
-    related_ids = result.get("related_memories", [])
-    if not related_ids:
+    related_indices = result.get("related_indices", [])
+    if not related_indices:
         return {"findings": existing}
 
-    memory_map = {m["id"]: m for m in memories}
     historical_findings = []
-    for mid in related_ids:
-        m = memory_map.get(mid)
-        if m:
+    for idx in related_indices:
+        if 0 <= idx < len(memories):
+            m = memories[idx]
             historical_findings.append({
                 "content": m.get("content", ""),
                 "source_url": m.get("source_url", ""),
-                "topic": m.get("topic", "history"),
+                "topic": m.get("name", "history"),
             })
     return {"findings": existing + historical_findings}
 
@@ -234,29 +265,16 @@ def check_history_node(state: AgentState) -> dict[str, Any]:
 # ── Node 4: clarify ──────────────────────────────────────────────────
 
 def clarify_node(state: AgentState) -> dict[str, Any]:
-    """判断是否需要用户补充范围（基于初步搜索结果，信息不足再问用户）。"""
+    """判断是否需要用户补充范围（在搜索之前，基于查询本身判断范围是否明确）。"""
     logger.debug(f"clarify_node resolved_query='{state.get('resolved_query', '')}'")
     query = state.get("resolved_query", state["query"])
-    findings = state.get("findings", [])
-    summaries = state.get("page_summaries", [])
-    search_context = ""
-    if findings:
-        sample = findings[:5]
-        search_context = "已获取的初步信息：\n" + "\n".join(
-            f"- {f.get('content', '')[:200]}" for f in sample
-        )
-    if summaries:
-        l0_lines = [s.get("l0_summary", "") for s in summaries if s.get("l0_summary")]
-        if l0_lines:
-            search_context += "\n\n页面摘要：\n" + "\n".join(f"- {l}" for l in l0_lines[:5])
-    result = need_clarification(query, preliminary_findings=search_context)
+    result = need_clarification(query)
     return {
         "need_scope": result.get("need_scope", False),
         "scope": {
             "suggested_dimensions": result.get("suggested_dimensions", []),
             "need_hitl": result.get("need_scope", False),
         },
-        "_clarify_done": True,
     }
 
 
@@ -284,50 +302,76 @@ def planner_node(state: AgentState) -> dict[str, Any]:
 
 # ── Node 6: search ──────────────────────────────────────────────────
 
-_searcher: MetasoSearch | None = None
+_primary_searcher: MetasoSearch | None = None
+_fallback_searcher: DuckDuckGoSearch | None = None
+
+
+def _search_one_engine(
+    sq: str, engine: MetasoSearch | DuckDuckGoSearch
+) -> list[dict[str, Any]]:
+    items = engine.search(sq, num_results=3)
+    return [
+        {"title": r.title, "url": r.url, "snippet": r.snippet, "query": sq}
+        for r in items
+    ]
 
 
 def search_node(state: AgentState) -> dict[str, Any]:
-    """执行搜索：对每个子查询搜索。"""
+    """执行搜索：优先 MetasoSearch，全部失败后 fallback 到 DuckDuckGoSearch。"""
     logger.debug(f"search_node sub_queries={state.get('sub_queries', [])}")
-    global _searcher
-    if _searcher is None:
-        _searcher = MetasoSearch()
-    
+    global _primary_searcher, _fallback_searcher
+    if _primary_searcher is None:
+        _primary_searcher = MetasoSearch()
+    if _fallback_searcher is None:
+        _fallback_searcher = DuckDuckGoSearch()
+
     sub_queries = state.get("sub_queries", [state.get("resolved_query", state["query"])])
     all_results: list[dict[str, Any]] = []
-    
-    def _search_one(sq: str) -> list[dict[str, Any]]:
-        items = _searcher.search(sq, num_results=3)
-        return [
-            {"title": r.title, "url": r.url, "snippet": r.snippet, "query": sq}
-            for r in items
-        ]
-    
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        fut_map = {pool.submit(_search_one, sq): sq for sq in sub_queries}
-        for future in as_completed(fut_map):
-            sq = fut_map[future]
+
+    def _try_engine(engine, label: str) -> bool:
+        nonlocal all_results
+        results: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=min(5, len(sub_queries))) as pool:
+            fut_map = {pool.submit(_search_one_engine, sq, engine): sq for sq in sub_queries}
+            for future in as_completed(fut_map):
+                sq = fut_map[future]
+                try:
+                    results.extend(future.result())
+                except RuntimeError as e:
+                    logger.warning(f"[{label}] 搜索失败 query='{sq}': {e}")
+                    continue
+        if results:
+            all_results = results
+            logger.info(f"[{label}] 成功返回 {len(results)} 条结果")
+            return True
+        return False
+
+    if not _try_engine(_primary_searcher, "MetasoSearch"):
+        logger.warning("MetasoSearch 全部失败，fallback 到 DuckDuckGoSearch")
+        if not _try_engine(_fallback_searcher, "DuckDuckGo"):
+            fallback_query = state.get("resolved_query", state["query"])
+            logger.warning(f"DuckDuckGo 也失败，fallback 到原始 query='{fallback_query}'")
             try:
-                all_results.extend(future.result())
-            except RuntimeError as e:
-                logger.warning(f"搜索失败 query='{sq}': {e}")
-                continue
-    
-    if not all_results:
-        fallback_query = state.get("resolved_query", state["query"])
-        logger.warning(f"所有 sub_queries 都失败，fallback 到原始 query='{fallback_query}'")
-        try:
-            items = _searcher.search(fallback_query, num_results=3)
-            all_results.extend([
-                {"title": r.title, "url": r.url, "snippet": r.snippet, "query": fallback_query}
-                for r in items
-            ])
-        except Exception as e:
-            logger.warning(f"fallback 也失败: {e}")
+                items = _fallback_searcher.search(fallback_query, num_results=3)
+                all_results.extend([
+                    {"title": r.title, "url": r.url, "snippet": r.snippet, "query": fallback_query}
+                    for r in items
+                ])
+            except Exception as e:
+                logger.warning(f"最终 fallback 也失败: {e}")
 
     search_all_failed = not all_results
     increment = 1 if state.get("intent") == "deep_research" else 0
+
+    # 回环过滤：过滤掉 scraped_pages 中已有的 URL，避免重复抓取
+    existing_urls = {p.get("url", "") for p in state.get("scraped_pages", []) if p.get("url")}
+    if existing_urls and not state.get("search_all_failed"):
+        before = len(all_results)
+        all_results = [r for r in all_results if r.get("url") not in existing_urls]
+        if before != len(all_results):
+            logger.info(f"search_node: 过滤 {before - len(all_results)} 个已抓取 URL，剩余 {len(all_results)} 个")
+    search_all_failed = not all_results
+
     return {
         "search_results": all_results,
         "search_all_failed": search_all_failed,
@@ -369,9 +413,11 @@ def scrape_node(state: AgentState) -> dict[str, Any]:
                 "url": url, "title": page.title or "",
                 "content": "", "success": False, "error": page.error,
             }
+        snippet = snippet_map.get(url, "")
         return {
             "url": page.url, "title": page.title,
-            "content": page.content, "success": True, "error": "",
+            "content": page.content, "snippet": snippet,
+            "success": True, "error": "",
         }
 
     scraped: list[dict[str, Any]] = []
@@ -388,7 +434,7 @@ def scrape_node(state: AgentState) -> dict[str, Any]:
 # ── Node 8: context_mgr ─────────────────────────────────────────────
 
 def context_mgr_node(state: AgentState) -> dict[str, Any]:
-    """上下文管理：提取 L1/L0 并检查同话题重复。跳过过短页面。"""
+    """上下文管理：提取关键要点并检查同话题重复。跳过过短页面。"""
     logger.debug(f"context_mgr_node scraped_pages={len(state.get('scraped_pages', []))}")
     pages = state.get("scraped_pages", [])
     new_summaries: list[dict[str, Any]] = []
@@ -400,17 +446,27 @@ def context_mgr_node(state: AgentState) -> dict[str, Any]:
         if len(content) < 100:
             logger.debug(f"跳过过短页面 url={page['url']} len={len(content)}")
             return None
-        extracted = extract_from_content(page.get("title", ""), content)
+        page_query = state.get("resolved_query", state.get("query", ""))
+        if page_query:
+            judge_text = (page.get("snippet", "") + " " + content[:300]).strip()
+            scores = rerank(page_query, [judge_text], top_k=1)
+            if scores and scores[0][1] < 0.2:
+                logger.debug(f"页面不相关，跳过提取 url={page['url']} score={scores[0][1]:.4f}")
+                return None
+        brief = brief_from_page(page.get("title", ""), content)
+        key_points = brief.get("key_points", [])
+        topic_list = list(set(kp.get("topic", "") for kp in key_points if kp.get("topic")))
         return {
             "url": page["url"],
             "title": page.get("title", ""),
-            "topic": "",
-            "l1_content": json.dumps(extracted.get("findings", []), ensure_ascii=False),
-            "l0_summary": extracted.get("l0_summary", ""),
-            "findings": extracted.get("findings", []),
+            "topic": topic_list[0] if topic_list else "",
+            "key_points_json": json.dumps(key_points, ensure_ascii=False),
+            "page_abstract": "; ".join(kp.get("content")[:80] for kp in key_points[:3]),
+            "findings": key_points,
         }
 
-    eligible = [p for p in pages if p.get("success") and p.get("content") and len(p["content"]) >= 100]
+    processed_urls = {s.get("url", "") for s in state.get("page_summaries", []) if s.get("url")}
+    eligible = [p for p in pages if p.get("success") and p.get("content") and len(p["content"]) >= 100 and p.get("url", "") not in processed_urls]
     with ThreadPoolExecutor(max_workers=5) as pool:
         fut_map = {pool.submit(_extract_page, p): p for p in eligible}
         for future in as_completed(fut_map):
@@ -424,7 +480,7 @@ def context_mgr_node(state: AgentState) -> dict[str, Any]:
 # ── Node 9: dedup ──────────────────────────────────────────────────
 
 def dedup_rerank_node(state: AgentState) -> dict[str, Any]:
-    """合并去重+重排：先 dedup 再 rerank，减少一次 state 读写。"""
+    """合并去重+重排：将 page_summaries 中的 findings 合并到 state.findings，再 dedup + rerank。"""
     logger.debug(f"dedup_rerank_node summaries={len(state.get('page_summaries', []))}")
     summaries = state.get("page_summaries", [])
     batch: list[str] = []
@@ -448,21 +504,14 @@ def dedup_rerank_node(state: AgentState) -> dict[str, Any]:
     existing = state.get("findings", [])
     existing_batch = [f.get("content", "") for f in existing if f.get("content")]
     existing_embs = embed_text(existing_batch) if existing_batch else []
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     all_findings: list[dict[str, Any]] = []
     for i, (si, fi) in enumerate(batch_meta):
         emb = embeddings[i]
-        results = search_memory_by_vector(emb, limit=1, min_score=0.88)
-        if results:
+        # 轮内去重：检查与当前 session 已有 findings 的语义相似度
+        if existing_embs and max_cosine_similarity(emb, existing_embs) >= SEMANTIC_DUP_THRESHOLD:
             continue
-        # 跨轮次去重：检查与当前 session 已有 findings 的语义相似度
-        if existing_embs:
-            emb_t = torch.tensor(emb, device=device).unsqueeze(0)
-            existing_t = torch.tensor(existing_embs, device=device)
-            if (F.cosine_similarity(emb_t, existing_t).max().item() >= 0.88):
-                continue
-        f = summaries[si]["findings"][fi]
+        f = dict(summaries[si]["findings"][fi])
         f["source_url"] = summaries[si].get("url", "")
         all_findings.append(f)
 
@@ -471,6 +520,8 @@ def dedup_rerank_node(state: AgentState) -> dict[str, Any]:
     query = state.get("resolved_query", state["query"])
     if merged:
         ranked = rank_findings(query, merged, top_k=15)
+        ranked = [r for r in ranked if r.get("score", 0) >= 0.3]
+        logger.debug(f"dedup_rerank_node after threshold={len(ranked)}")
         return {"findings": ranked}
     return {"findings": merged}
 
@@ -478,38 +529,58 @@ def dedup_rerank_node(state: AgentState) -> dict[str, Any]:
 # ── Node 11: assess ─────────────────────────────────────────────────
 
 def assess_node(state: AgentState) -> dict[str, Any]:
-    """覆盖度评估 + 冲突检测。"""
+    """动态大纲 + 逐章覆盖度评估 + 冲突检测。"""
     logger.debug(f"assess_node deep_search_count={state.get('deep_search_count', 0)}")
     query = state.get("resolved_query", state["query"])
     findings = state.get("findings", [])
-    summaries = state.get("page_summaries", [])
     deep_count = state.get("deep_search_count", 0)
 
-    if state.get("search_all_failed") and not findings:
-        logger.info("搜索全部失败且无已有 findings，标记为需要 LLM fallback")
-        return {
-            "sufficient": True,
-            "has_conflict": False,
-            "_llm_fallback": True,
-            "sub_queries": state.get("sub_queries", []),
-            "assess_round": state.get("assess_round", 0) + 1,
-        }
-    
     dimensions = list(set(f.get("topic", "") for f in findings if f.get("topic")))
-    l0_text = "\n".join(
-        f"- {s.get('l0_summary', '')}" for s in summaries if s.get("l0_summary")
-    )
+    extract_text = "\n".join(
+        f"- [{f.get('topic', 'general')}] {f.get('content', '')[:100]}"
+        for f in findings[:10]
+    ) if findings else "暂无发现"
+
+    details_text = "\n".join(
+        f"- [{f.get('topic', 'general')}] {f.get('content', '')[:300]}"
+        for f in findings[:15]
+    ) if findings else "暂无发现"
+
+    scraped_pages = state.get("scraped_pages", [])
+    pages_text = "\n".join(
+        f"- {p.get('title', '')} | 来源: {p.get('url', '')} | 长度: {len(p.get('content', ''))} 字"
+        for p in scraped_pages if p.get("success") and p.get("content")
+    ) if scraped_pages else "暂无已抓取页面"
+    
+    # 处理已有大纲：格式化或标注为空
+    existing_outline = state.get("outline", [])
+    if existing_outline:
+        outline_lines = []
+        for i, o in enumerate(existing_outline, 1):
+            points = ", ".join(o.get("points", []))
+            outline_lines.append(f"[{i}] {o.get('section', '')}: {points}")
+        outline_text = "\n".join(outline_lines)
+    else:
+        outline_text = "暂无大纲，请根据查询主题生成"
     
     result = chat_json([
         {"role": "system", "content": "你是评估专家。请用 JSON 格式回答。"},
         {"role": "user", "content": _ASSESS_PROMPT.format(
+            outline_text=outline_text,
             search_count=deep_count,
             findings_count=len(findings),
             dimensions=", ".join(dimensions) if dimensions else "暂无",
-            l0_summaries=l0_text or "暂无",
+            extracts=extract_text or "暂无",
+            findings_detail=details_text or "暂无",
+            pages=pages_text or "暂无",
             query=query,
         )},
     ])
+    
+    logger.info(f"assess coverage={result.get('coverage_score', 0)} detail={result.get('score_detail', {})} sufficient={result.get('sufficient', False)}")
+
+    # 解析大纲（新生成的或更新后的）
+    outline = result.get("outline", existing_outline) or existing_outline
     
     new_sub = result.get("new_sub_queries", [])
     has_conflict = result.get("has_conflict", False)
@@ -534,32 +605,23 @@ def assess_node(state: AgentState) -> dict[str, Any]:
                     "credibility_tag": tag,
                 })
         try:
-            from src.search.scraper import Scraper
-            scraper = Scraper()
+            page_by_url = {p.get("url", ""): p for p in state.get("scraped_pages", []) if p.get("success") and p.get("content")}
             conflict_contents = []
             for cf in conflict_findings[:3]:
                 url = cf["url"]
-                try:
-                    page = scraper.scrape(url)
-                    if page.success and page.content:
-                        conflict_contents.append(
-                            f"来源: {url}\n"
-                            f"可信度: {cf['credibility_score']}/100（{cf['credibility_tag']}）\n"
-                            f"标题: {page.title}\n"
-                            f"内容:\n{page.content[:2000]}"
-                        )
-                    else:
-                        conflict_contents.append(
-                            f"来源: {url}\n"
-                            f"可信度: {cf['credibility_score']}/100（{cf['credibility_tag']}）\n"
-                            f"（原文抓取失败，使用摘要信息）\n"
-                            f"{cf['content'][:500]}"
-                        )
-                except Exception:
-                    logger.warning(f"冲突源抓取失败: {url}")
+                page = page_by_url.get(url)
+                if page and page.get("content"):
                     conflict_contents.append(
                         f"来源: {url}\n"
                         f"可信度: {cf['credibility_score']}/100（{cf['credibility_tag']}）\n"
+                        f"标题: {page.get('title', '')}\n"
+                        f"内容:\n{page['content'][:2000]}"
+                    )
+                else:
+                    conflict_contents.append(
+                        f"来源: {url}\n"
+                        f"可信度: {cf['credibility_score']}/100（{cf['credibility_tag']}）\n"
+                        f"（无全文缓存，使用摘要信息）\n"
                         f"{cf['content'][:500]}"
                     )
             if conflict_contents:
@@ -589,20 +651,29 @@ def assess_node(state: AgentState) -> dict[str, Any]:
         except Exception:
             logger.exception("冲突裁决失败，保持原冲突状态")
 
+    coverage_score = result.get("coverage_score", 0)
+
+    llm_fallback = state.get("search_all_failed") and not state.get("findings", [])
+
     return {
-        "sufficient": result.get("sufficient", True),
-        "coverage_score": result.get("coverage_score", 0),
+        "outline": outline,
+        "findings": state.get("findings", []),
+        "coverage_score": coverage_score,
         "has_conflict": has_conflict,
         "conflict_description": conflict_description,
         "sub_queries": new_sub if new_sub else state.get("sub_queries", []),
         "assess_round": state.get("assess_round", 0) + 1,
+        "_llm_fallback": llm_fallback,
+        "sufficient": result.get("sufficient", False),
+        "score_detail": result.get("score_detail", {}),
+        "gaps": result.get("gaps", []),
     }
 
 
 # ── Node 12: synthesize ─────────────────────────────────────────────
 
 def synthesize_node(state: AgentState) -> dict[str, Any]:
-    """综合生成新章节内容。"""
+    """准备 findings 和话题。LLM 内容生成已移到 report_node。"""
     logger.debug(f"synthesize_node findings={len(state.get('findings', []))}")
     findings = state.get("findings", [])
 
@@ -616,7 +687,7 @@ def synthesize_node(state: AgentState) -> dict[str, Any]:
         return {"sections": {"answer": response}}
 
     if not findings:
-        return {}
+        return {"sections": {}}
 
     refine_name = state.get("refine_section_name", "")
     intent = state.get("intent", "")
@@ -627,19 +698,14 @@ def synthesize_node(state: AgentState) -> dict[str, Any]:
     else:
         topic = state.get("resolved_query", state["query"])[:100]
 
-    result = synthesize_section(findings, topic)
-    return {
-        "sections": {result.get("section_title", topic): result.get("content", "")},
-        "need_outline_review": False,
-    }
+    return {"turn_topic": topic}
 
 
 # ── Node 13: report ─────────────────────────────────────────────────
 
 def _build_footnotes(state: AgentState) -> str:
-    """从 memory_store L2 构建引用脚注（含 snippet 预览）。"""
+    """从 scraped_pages 构建引用脚注（含 snippet 预览）。"""
     from src.memory.credibility import get_source_tag
-    from src.db.postgres import get_l2_by_url
 
     seen = set()
     notes = []
@@ -650,12 +716,8 @@ def _build_footnotes(state: AgentState) -> str:
         seen.add(url)
 
         tag = get_source_tag(url)
-        l2_records = get_l2_by_url(url)
-        snippet = ""
-        title = ""
-        if l2_records and l2_records[0].get("content"):
-            snippet = l2_records[0]["content"][:200]
-            title = l2_records[0].get("topic", "")
+        title = p.get("title", "") or ""
+        snippet = (p.get("content", "") or "")[:200]
 
         if snippet:
             notes.append(f"- [{tag}] **{title}**\n  {snippet}\n  [{url}]")
@@ -664,149 +726,139 @@ def _build_footnotes(state: AgentState) -> str:
 
     if not notes:
         return ""
-    return "\n\n---\n### 来源\n" + "\n".join(notes)
+    body = "\n".join(notes)
+    return f"<details><summary>📚 来源（{len(notes)} 个）</summary>\n\n{body}\n\n</details>"
 
 
 async def report_node(state: AgentState) -> dict[str, Any]:
-    """生成完整报告（首次）或增量更新章节（后续）。支持流式输出。"""
-    logger.debug(f"report_node sections_count={len(state.get('sections', {}))}")
+    """统一流式报告生成。所有意图路径都流式输出，每轮生成独立内容。"""
+    logger.debug(f"report_node intent={state.get('intent', '')}")
+    intent = state.get("intent", "")
     query = state.get("resolved_query", state["query"])
     findings = state.get("findings", [])
+    cb = stream_callback_var.get()
     existing_report = state.get("report", "")
-    sections = state.get("sections", {})
 
-    if existing_report and sections:
-        report_parts = [sections[ch] for ch in sections if sections.get(ch)]
+    # _llm_fallback: 内容已在 synthesize_node 中生成，直接使用
+    sections_from_synth = state.get("sections", {})
+    if state.get("_llm_fallback") and not findings and sections_from_synth:
+        turn_report = "\n\n".join(v for v in sections_from_synth.values() if v)
+        report = turn_report
         return {
-            "report": "\n\n".join(report_parts),
-            "outline": state.get("outline", []),
+            "report": report,
+            "turn_report": turn_report,
+            "sections": sections_from_synth,
+            "_report_streamed": False,
         }
 
-    outline = state.get("outline")
-    if not outline:
-        outline = generate_outline(query)
+    # 正常路径：流式生成本轮内容
+    if intent in ("refine_section", "new_search_topic"):
+        topic = state.get("refine_section_name", query)
+        outline = [{"section": topic, "points": []}]
+        footnotes = _build_footnotes(state)
+        result = await generate_report_stream(query, outline, findings, on_token=cb)
+        turn_report = result.get("report", "")
+        if footnotes:
+            await cb(footnotes) if cb else None
+            turn_report += footnotes
+        sections = result.get("sections", {})
+        outline_used = outline
+    else:
+        # deep_research
+        outline = state.get("outline")
+        if not outline:
+            outline = generate_outline(query)
+        footnotes = _build_footnotes(state)
+        result = await generate_report_stream(query, outline, findings, on_token=cb)
+        turn_report = result.get("report", "")
+        if footnotes:
+            await cb(footnotes) if cb else None
+            turn_report += footnotes
+        sections = result.get("sections", {})
+        outline_used = outline
 
-    footnotes = _build_footnotes(state)
+    # 构建累积报告（内部上下文用，不展示）
+    if existing_report and turn_report:
+        report = existing_report + "\n\n---\n\n" + turn_report
+    else:
+        report = turn_report
 
-    cb = stream_callback_var.get()
-    result = await generate_report_stream(query, outline, findings, on_token=cb)
-    report = result.get("report", "")
-    if footnotes:
-        report += footnotes
     return {
         "report": report,
-        "sections": result.get("sections", {}),
-        "outline": outline,
+        "turn_report": turn_report,
+        "sections": sections,
+        "outline": outline_used,
         "_report_streamed": True,
     }
+
+
+_L0_COMPRESS_PROMPT = """将以下用户问题和研究报告压缩为一句摘要（≤100字）。
+
+用户问题：{query}
+
+报告内容：
+{report}
+
+要求：
+1. 保留用户问题的核心意图
+2. 提取报告中最关键的发现/结论
+3. 一句话，中文，≤100字
+
+返回 JSON：{{"summary": "..."}}
+"""
+
+def _compress_l0(query: str, report: str) -> str:
+    """LLM 压缩 query + report → ≤100 字 L0 摘要。"""
+    if not report or len(report.strip()) < 50:
+        return query[:100]
+    try:
+        result = chat_json([
+            {"role": "system", "content": "你是摘要专家。请用 JSON 格式回答。"},
+            {"role": "user", "content": _L0_COMPRESS_PROMPT.format(
+                query=query, report=report[:2000]
+            )},
+        ])
+        summary = (result.get("summary") or query)[:100]
+        logger.debug(f"_compress_l0 summary='{summary}'")
+        return summary
+    except Exception:
+        logger.exception("L0 compress failed, fallback to query")
+        return query[:100]
 
 
 # ── Node 14: memory ─────────────────────────────────────────────────
 
 def memory_node(state: AgentState) -> dict[str, Any]:
-    """记忆持久化：research_tasks + memory_store(L1+L2) + source_credibility + chat_history。"""
+    """持久化：research_tasks + chat_history + 长期记忆（L1）。"""
     logger.debug(f"memory_node task_id={state.get('task_id', 0)}")
     task_id = state.get("task_id", 0)
     if not task_id:
         return {}
+    session_id = state["session_id"]
+    query = state.get("resolved_query", state["query"])
+    report = state.get("report", "")
 
-    # 更新任务状态和报告
-    update_task(task_id, status="completed", report=state.get("report", ""))
+    # ── 阶段 1：L0 压缩摘要 + 写表 ──
+    l0 = _compress_l0(query, report)
+    update_task(task_id, status="completed", report=report, l0_summary=l0)
 
-    # 更新 L0
-    findings = state.get("findings", [])
-    if findings:
-        try:
-            result = chat_json([
-                {"role": "system", "content": "你是信息压缩专家。请用 JSON 格式回答。"},
-                {"role": "user", "content": _MEMORY_NODE_PROMPT.format(
-                    new_findings="\n".join(f.get("content", "") for f in findings[:5])
-                )},
-            ])
-            l0 = result.get("l0_summary", "")
-            if l0:
-                update_task(task_id, l0_summary=l0)
-        except Exception:
-            logger.exception("memory_node L0 compression failed")
-
-    # 写 L1 到 memory_store（含 embedding 用于跨会话语义检索）
-    # 先用 LLM 过滤掉不适合长期存储的发现
-    high_quality_findings = []
-    for f in findings:
-        content = f.get("content", "")
-        if content and len(content) >= 50:
-            high_quality_findings.append(f)
-
-    keep_indices = []
-    if high_quality_findings:
-        try:
-            result = chat_json([
-                {"role": "system", "content": "你是一个记忆质量评估专家。请用 JSON 格式回答。"},
-                {"role": "user", "content": _MEMORY_FILTER_PROMPT.format(
-                    query=state.get("resolved_query", state.get("query", "")),
-                    findings="\n".join(f"{i}. {f['content'][:300]}" for i, f in enumerate(high_quality_findings))
-                )},
-            ])
-            keep_indices = result.get("keep_indices", [])
-            logger.info(f"memory_node LLM 过滤: 原始 {len(findings)} 条, 通过 {len(keep_indices)} 条")
-        except Exception:
-            logger.exception("memory_node LLM 过滤失败，回退到全部写入")
-            keep_indices = list(range(len(high_quality_findings)))
-
-    # 写入通过过滤的 L1
-    for i in keep_indices:
-        if 0 <= i < len(high_quality_findings):
-            f = high_quality_findings[i]
-            content = f.get("content", "")
-            try:
-                check = dedup_check(content)
-                if check["is_duplicate"] and check["matched_id"]:
-                    update_memory(check["matched_id"], content)
-                else:
-                    emb = embed_text(content)
-                    insert_memory(
-                        task_id=task_id,
-                        level="L1",
-                        content=content,
-                        source_url=f.get("source_url", ""),
-                        topic=f.get("topic", ""),
-                        embedding=emb,
-                    )
-            except Exception:
-                logger.exception("memory_node L1 insert failed")
-
-    # 写 L2 到 memory_store（只存 url + title + snippet，用于前端引用展示）
-    for p in state.get("scraped_pages", []):
-        if p.get("success"):
-            try:
-                snippet = p.get("snippet", "")[:500] if p.get("snippet") else ""
-                if not snippet and p.get("content"):
-                    snippet = p.get("content", "")[:500]
-                insert_memory(
-                    task_id=task_id,
-                    level="L2",
-                    content=snippet,
-                    source_url=p.get("url", ""),
-                    topic=(p.get("title", "") or "")[:255],
-                    embedding=None,
-                )
-            except Exception:
-                logger.exception("memory_node L2 insert failed")
-
-    # 更新来源信誉
-    for p in state.get("scraped_pages", []):
-        try:
-            upsert_credibility(p["url"], urlparse(p["url"]).netloc, p.get("success", False))
-        except Exception:
-            logger.exception("memory_node credibility update failed")
-
-    # 写聊天记录
+    turn_report = state.get("turn_report", report)
     try:
-        insert_chat_message(state["session_id"], "assistant", state.get("report", ""))
+        insert_chat_message(session_id, "assistant", turn_report)
     except Exception:
         logger.exception("memory_node chat history write failed")
 
+    # ── 阶段 2：写入长期记忆（L1 user/memories）──
+    _write_long_term_memory(session_id, task_id, report)
+
     return {"status": "completed"}
+
+
+def _write_long_term_memory(session_id: str, task_id: int, report: str) -> None:
+    """写入长期记忆：从报告提取知识到 user/memories/。"""
+    if not report or len(report.strip()) < 200:
+        return
+    memory_update(session_id=session_id, task_id=task_id, report=report)
 
 
 # ── Node 15: simple_llm ─────────────────────────────────────────────
@@ -837,7 +889,7 @@ def simple_llm_node(state: AgentState) -> dict[str, Any]:
 # ── Node 16: memory_llm ──────────────────────────────────────────────
 
 def memory_llm_node(state: AgentState) -> dict[str, Any]:
-    """轻量版记忆持久化：chat_history + query+回答写入 L1。"""
+    """轻量版持久化：仅写 chat_history，不写入长期记忆。"""
     try:
         insert_chat_message(state["session_id"], "assistant", state.get("report", ""))
     except Exception:
@@ -845,10 +897,10 @@ def memory_llm_node(state: AgentState) -> dict[str, Any]:
     return {"status": "completed"}
 
 
-# ── HITL 中断节点（Nodes 17-20）──────────────────────────────────────
+# ── HITL 中断节点（Nodes 17-19）──────────────────────────────────────
 
 def hitl_scope_node(state: AgentState) -> dict[str, Any]:
-    """HITL 范围选择 — 中断等待用户选择调研维度。"""
+    """HITL 范围选择 — 中断等待用户选择调研维度。选择后过滤子查询避免重复规划。"""
     logger.debug(f"hitl_scope_node session_id='{state['session_id']}'")
     dimensions = state.get("scope", {}).get("suggested_dimensions", [])
     resume_data = interrupt({
@@ -857,7 +909,14 @@ def hitl_scope_node(state: AgentState) -> dict[str, Any]:
         "options": {"dimensions": dimensions},
     })
     selected = resume_data.get("selectedDimensions", []) if isinstance(resume_data, dict) else []
-    return {"need_scope": False, "selected_dimensions": selected}
+    # 根据选择的维度过滤已有子查询，避免重新规划浪费一轮搜索
+    original = state.get("sub_queries", [])
+    if selected and original:
+        filtered = [sq for sq in original if any(dim in sq for dim in selected)]
+        sub_queries = filtered if filtered else original
+    else:
+        sub_queries = original
+    return {"need_scope": False, "sub_queries": sub_queries}
 
 
 def hitl_adjust_node(state: AgentState) -> dict[str, Any]:
@@ -885,54 +944,55 @@ def hitl_conflict_node(state: AgentState) -> dict[str, Any]:
     return {"has_conflict": False, "conflict_resolution": choice}
 
 
-def hitl_outline_node(state: AgentState) -> dict[str, Any]:
-    """HITL 大纲微调 — 中断等待用户调整报告大纲。"""
-    logger.debug(f"hitl_outline_node session_id='{state['session_id']}'")
-    resume_data = interrupt({
-        "mode": "outline_edit",
-        "session_id": state["session_id"],
-        "options": {"outline": state.get("outline", [])},
-    })
-    outline = resume_data.get("outline", "") if isinstance(resume_data, dict) else ""
-    return {"need_outline_review": False, "outline": outline}
-
 
 # ── 路由函数 ─────────────────────────────────────────────────────────
 
+def route_after_planner(state: AgentState) -> str:
+    """planner 后分叉：refine 跳过 clarify 直接搜索，deep_research 走 clarify。"""
+    intent = state.get("intent", "")
+    if intent == "refine_section":
+        return "search"
+    if state.get("need_adjust", False):
+        return "hitl_adjust"
+    return "clarify"
+
+
 def route_by_intent(state: AgentState) -> str:
-    """根据 intent 选择路径。"""
+    """根据 intent 选择路径。refine 也走 check_history → planner 生成新子查询。"""
     intent = state.get("intent", "simple_llm")
     logger.debug(f"route_by_intent intent={intent}")
-    if intent in ("deep_research", "new_search_topic"):
+    if intent in ("deep_research", "refine_section", "new_search_topic"):
         return "check_history"
-    elif intent == "refine_section":
-        return "search"
     else:
         return "simple_llm"
 
 
 def route_after_rerank(state: AgentState) -> str:
-    """rerank 后根据 intent 和阶段分叉。"""
+    """rerank 后分叉。refine_section / new_search_topic 跳过 assess 直连 synthesize。"""
     intent = state.get("intent", "")
-    logger.debug(f"route_after_rerank intent={intent} clarify_done={state.get('_clarify_done', False)}")
-    if intent == "refine_section":
+    logger.debug(f"route_after_rerank intent={intent}")
+    if intent in ("refine_section", "new_search_topic"):
         return "synthesize"
-    # deep_research / new_search_topic: 首次搜索后先去 clarify（有搜索结果支撑），后续循环直接 assess
-    if not state.get("_clarify_done", False):
-        return "clarify"
     return "assess"
 
 
 def route_assess(state: AgentState) -> str:
-    """assess 后决定：覆盖率不足→回搜索，有冲突→HITL，足够→综合。
-   动态阈值：覆盖率 < 70 且轮次 < 3 继续搜索，否则进入综合。"""
+    """assess 后决策：仅 deep_research 走搜索回环，其余路径此时不应进入 assess。"""
+    intent = state.get("intent", "")
     coverage_score = state.get("coverage_score", 0)
     assess_round = state.get("assess_round", 0)
     has_conflict = state.get("has_conflict", False)
-    logger.debug(f"route_assess coverage_score={coverage_score} assess_round={assess_round} has_conflict={has_conflict}")
+    sufficient = state.get("sufficient", False)
+    logger.debug(f"route_assess intent={intent} coverage_score={coverage_score} assess_round={assess_round} has_conflict={has_conflict} sufficient={sufficient}")
 
     if has_conflict:
         return "hitl_conflict"
-    if coverage_score < 70 and assess_round < 3:
+    if state.get("_llm_fallback"):
+        return "synthesize"
+    if sufficient:
+        return "synthesize"
+    if intent != "deep_research":
+        return "synthesize"
+    if coverage_score < 60 and assess_round < 3:
         return "search"
     return "synthesize"

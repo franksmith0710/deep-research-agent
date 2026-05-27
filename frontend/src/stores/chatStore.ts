@@ -1,7 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type { ChatMessage, ChainEvent } from '../types'
-import { useReportStore } from './reportStore'
 
 export const useChatStore = defineStore('chat', () => {
   const messages = ref<ChatMessage[]>([])
@@ -12,33 +11,44 @@ export const useChatStore = defineStore('chat', () => {
   const streamingText = ref('')
   const isStreaming = ref(false)
 
+  // 刷新后恢复的后台运行状态
+  const runStatus = ref('')       // '' | 'running' | 'hitl_waiting' | 'completed'
+  const currentStep = ref('')     // 当前步骤描述（如 "正在搜索相关信息..."）
+  const pendingQuery = ref<string | null>(null)  // 排队等待发送的查询
+  let statusPollTimer: ReturnType<typeof setInterval> | null = null
+
+  function startStatusPoll(onStatus: (s: string) => void) {
+    stopStatusPoll()
+    statusPollTimer = setInterval(onStatus, 3000)
+  }
+
+  function stopStatusPoll() {
+    if (statusPollTimer !== null) {
+      clearInterval(statusPollTimer)
+      statusPollTimer = null
+    }
+  }
+
   function addMessage(msg: ChatMessage) {
     messages.value.push(msg)
   }
 
   function addChainEvent(event: ChainEvent) {
-    const idx = allEvents.value.findIndex(e => e.node === event.node && e.type === event.type)
-    if (idx >= 0) {
-      allEvents.value[idx] = event
-    } else {
-      allEvents.value.push(event)
-    }
+    allEvents.value.push(event)
     currentEvent.value = event
   }
 
   function setMessages(msgs: ChatMessage[]) {
-    const existing = new Set(messages.value.map(m => m.id))
-    for (const msg of msgs) {
-      if (!existing.has(msg.id)) {
-        messages.value.push(msg)
-      }
-    }
+    messages.value = msgs
   }
 
   function appendStream(chunk: string) {
     if (!isStreaming.value) {
       isStreaming.value = true
       streamingText.value = ''
+      allEvents.value = []
+      currentEvent.value = null
+      currentStep.value = ''
     }
     streamingText.value += chunk
   }
@@ -54,7 +64,11 @@ export const useChatStore = defineStore('chat', () => {
     streamingText.value = ''
     isStreaming.value = false
     allEvents.value = []
-    currentEvent.value = null
+    currentStep.value = ''
+  }
+
+  function clearPending() {
+    pendingQuery.value = null
   }
 
   function reset() {
@@ -63,12 +77,16 @@ export const useChatStore = defineStore('chat', () => {
     currentEvent.value = null
     streamingText.value = ''
     isStreaming.value = false
-    const reportStore = useReportStore()
-    reportStore.reset()
+    runStatus.value = ''
+    currentStep.value = ''
+    pendingQuery.value = null
+    stopStatusPoll()
   }
 
   return {
     messages, chainEvents, allEvents, currentEvent, loading, streamingText, isStreaming,
-    addMessage, addChainEvent, setMessages, appendStream, finalizeStream, reset,
+    runStatus, currentStep, pendingQuery,
+    addMessage, addChainEvent, setMessages, appendStream, finalizeStream, reset, clearPending,
+    startStatusPoll, stopStatusPoll,
   }
 })

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any
 
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
@@ -11,8 +11,42 @@ from typing_extensions import TypedDict
 def _merge_sections(
     old: dict[str, str], new: dict[str, str]
 ) -> dict[str, str]:
-    """sections dict 合并 reducer：新章节覆盖旧章节，旧章节保留。"""
-    return {**old, **new}
+    """sections dict 合并 reducer：同名章节追加内容（去重标题），新章节直接添加。"""
+    result = dict(old)
+    for key, val in new.items():
+        if not val:
+            continue
+        if key in result and result[key]:
+            lines = val.split("\n", 1)
+            if lines[0].startswith("## "):
+                new_content = lines[1].strip() if len(lines) > 1 else ""
+            else:
+                new_content = val
+            if new_content:
+                result[key] = result[key] + "\n\n" + new_content
+        else:
+            result[key] = val
+    return result
+
+
+def _merge_pages(
+    old: list[dict], new: list[dict]
+) -> list[dict]:
+    """scraped_pages 合并 reducer：按 URL 去重追加。"""
+    seen = set()
+    for p in old:
+        u = p.get("url", "")
+        if u:
+            seen.add(u)
+    result = list(old)
+    for p in new:
+        u = p.get("url", "")
+        if u and u not in seen:
+            seen.add(u)
+            result.append(p)
+        elif not u:
+            result.append(p)
+    return result
 
 
 class AgentState(TypedDict):
@@ -36,14 +70,15 @@ class AgentState(TypedDict):
     
     # 搜索结果
     search_results: list[dict[str, Any]]
-    scraped_pages: list[dict[str, Any]]
-    page_summaries: list[dict[str, Any]]  # L0 摘要列表
+    scraped_pages: Annotated[list[dict[str, Any]], _merge_pages]
+    page_summaries: list[dict[str, Any]]  # 逐页简报列表（含 key_points_json + page_abstract）
     
     # 发现
-    findings: list[dict[str, Any]]  # 全部 L1 发现
+    findings: list[dict[str, Any]]  # 合并去重后的本轮发现（供 report 使用）
     
     # 报告
-    report: str
+    report: str  # 累积报告（用于上下文）
+    turn_report: str  # 本轮独立输出内容（写 chat_history）
     sections: Annotated[dict[str, str], _merge_sections]  # 章节名→内容，用于 patch
     
     # 控制
@@ -53,19 +88,15 @@ class AgentState(TypedDict):
     
     # HITL 条件标记
     need_scope: bool
-    _clarify_done: bool
     need_adjust: bool
     has_conflict: bool
     conflict_description: str
-    sufficient: bool
     coverage_score: int
-    need_outline_review: bool
-    hitl_result: dict[str, Any]  # 用户 HITL 输入
     
-    # 状态
-    status: str  # pending / running / hitl_waiting / completed / error
-    error: Optional[str]
-    chain_events: list[dict[str, Any]]  # 累积 chain 事件
+    # 搜索 Fallback 标记
+    search_all_failed: bool
+    _llm_fallback: bool
+    _report_streamed: bool
 
 
 def make_initial_state(
@@ -88,20 +119,17 @@ def make_initial_state(
         "page_summaries": [],
         "findings": [],
         "report": "",
+        "turn_report": "",
         "sections": {},
         "deep_search_count": 0,
         "assess_round": 0,
         "refine_section_name": "",
         "need_scope": False,
-        "_clarify_done": False,
         "need_adjust": False,
         "has_conflict": False,
         "conflict_description": "",
-        "sufficient": True,
         "coverage_score": 0,
-        "need_outline_review": False,
-        "hitl_result": {},
-        "status": "pending",
-        "error": None,
-        "chain_events": [],
+        "search_all_failed": False,
+        "_llm_fallback": False,
+        "_report_streamed": False,
     }

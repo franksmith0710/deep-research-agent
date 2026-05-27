@@ -128,14 +128,19 @@ class Scraper:
         config = use_config()
         config["DEFAULT"]["EXTRACTION_TIMEOUT"] = "5"
 
-        title = trafilatura.extract(
-            html, output_format="txt", include_tables=False, include_links=False,
-            config=config, favor_precision=True,
-        )
+        # 单次提取：优先 markdown（含标题），避免 trafilatura 重复解析两次
         content = trafilatura.extract(
             html, output_format="markdown", include_tables=True, include_links=True,
             config=config, favor_recall=True,
         )
+        # 从 markdown 首行提取标题
+        title = ""
+        if content:
+            first_line = content.strip().split("\n")[0]
+            if first_line.startswith("# "):
+                title = first_line[2:].strip()
+            elif first_line.startswith("#"):
+                title = first_line[1:].strip()
 
         if not content:
             logger.info(f"trafilatura 提取失败，尝试 fallback url={url}")

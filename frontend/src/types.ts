@@ -20,7 +20,7 @@ export interface PatchEvent {
 }
 
 export interface HITLEvent {
-  mode: 'scope_select' | 'conflict_resolve' | 'outline_edit' | 'direction_adjust'
+  mode: 'scope_select' | 'conflict_resolve' | 'direction_adjust'
   session_id: string
   options: Record<string, unknown>
   ts: string
@@ -34,7 +34,7 @@ export interface SessionItem {
 }
 
 export interface SSEEvent {
-  event: 'chain' | 'text' | 'patch' | 'hitl'
+  event: 'chain' | 'text' | 'patch'
   data: string
 }
 

@@ -34,13 +34,13 @@ class ChainType(str, Enum):
 class HITLMode(str, Enum):
     scope_select = "scope_select"
     conflict_resolve = "conflict_resolve"
-    outline_edit = "outline_edit"
     direction_adjust = "direction_adjust"
 
 
-class MemoryLevel(str, Enum):
-    L1 = "L1"
-    L2 = "L2"
+class ContextType(str, Enum):
+    user_memory = "user_memory"
+    session = "session"
+    resource = "resource"
 
 
 # ── SSE 事件 ──────────────────────────────────────────────────────────
@@ -97,7 +97,6 @@ class HITLStatus(BaseModel):
     need_scope: bool = False
     need_adjust: bool = False
     has_conflict: bool = False
-    need_outline_review: bool = False
 
 
 # ── 搜索 / 抓取 ───────────────────────────────────────────────────────
@@ -120,8 +119,8 @@ class PageSummary(BaseModel):
     url: str
     title: str
     topic: str
-    l1_content: str   # L1: 核心发现（含来源 URL）
-    l0_summary: str   # L0: 一句话摘要
+    key_points_json: str   # 简报：本页关键要点的 JSON 序列化
+    page_abstract: str     # 简报：本页概要（首 3 个要点拼接）
 
 
 # ── 来源信誉 ──────────────────────────────────────────────────────────
@@ -144,15 +143,24 @@ class CredibilityInfo(BaseModel):
 
 # ── 记忆 ──────────────────────────────────────────────────────────────
 
-class MemoryItem(BaseModel):
+# ── 文件系统 ──────────────────────────────────────────────────────────
+
+class FSNode(BaseModel):
     id: int | None = None
-    task_id: int
-    level: MemoryLevel
-    content: str
-    source_url: str | None = None
-    topic: str | None = None
+    uri: str
+    parent_uri: str | None = None
+    is_directory: bool = False
+    name: str
+    context_type: ContextType = ContextType.user_memory
+    level: str | None = None
+    content: str | None = None
+    abstract: str | None = None
+    overview: str | None = None
     embedding: list[float] | None = None
+    source_url: str | None = None
+    metadata: dict | None = None
     created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 # ── API 请求 / 响应 ──────────────────────────────────────────────────

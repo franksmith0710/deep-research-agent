@@ -10,19 +10,19 @@ from src.logging_config import get_logger
 
 logger = get_logger("report")
 
-_OUTLINE_PROMPT = """你是一个报告架构师。为以下调研主题规划 7 章标准报告大纲。
+_OUTLINE_PROMPT = """你是一个报告架构师。为以下调研主题规划报告大纲。
 
 主题：{query}
 
 要求：
-1. 固定 7 章：摘要 / 调研背景与范围 / 核心现状与关键数据 / 多方观点与信息冲突 / 风险与信息缺口 / 总结与建议 / 引用来源
+1. 根据主题灵活决定章节数量和结构（4-8 章）
 2. 每章给出 2-4 个要点
 3. 中文
 
 返回 JSON：
 {{
     "outline": [
-        {{"section": "摘要", "points": ["要点1", "要点2"]}},
+        {{"section": "章节名", "points": ["要点1", "要点2"]}},
         ...
     ]
 }}
@@ -66,7 +66,7 @@ def _extract_sections(md: str) -> dict[str, str]:
 
 
 def generate_outline(query: str) -> list[dict[str, Any]]:
-    """生成 7 章报告大纲。"""
+    """动态生成报告大纲（4-8 章）。"""
     logger.debug(f"generate_outline query='{query[:50]}...'")
     result = chat_json([
         {"role": "system", "content": "你是报告架构师。请用 JSON 格式回答。"},

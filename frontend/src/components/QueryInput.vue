@@ -1,31 +1,27 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useSessionStore } from '../stores/sessionStore'
-import { researchSSE } from '../api'
+import { researchSSE, fetchStatus, fetchHistory } from '../api'
 import { useChatStore } from '../stores/chatStore'
 import { useSSE } from '../composables/useSSE'
 import type { useHITL } from '../composables/useHITL'
 
-const props = defineProps<{ hitl: ReturnType<typeof useHITL> }>()
-
+const props = defineProps<{ restore: ReturnType<typeof useHITL>['restore'] }>()
 const sessionStore = useSessionStore()
 const chatStore = useChatStore()
-const { handleEvent } = useSSE(props.hitl)
+const { handleEvent } = useSSE()
 
 const input = ref('')
 const sending = ref(false)
-const pending = ref<string | null>(null)
 let currentSource: ReturnType<typeof researchSSE> | null = null
 
 function onDone() {
-  props.hitl.setSSEActive(false)
-  props.hitl.close()
   sending.value = false
   chatStore.finalizeStream()
   currentSource = null
-  if (pending.value) {
-    const next = pending.value
-    pending.value = null
+  if (chatStore.pendingQuery) {
+    const next = chatStore.pendingQuery
+    chatStore.pendingQuery = null
     sendImmediate(next)
   }
 }
@@ -37,7 +33,6 @@ function abort() {
 defineExpose({ abort })
 
 async function sendImmediate(text: string) {
-  props.hitl.setSSEActive(true)
   sending.value = true
   const sid = sessionStore.currentSessionId
   chatStore.addMessage({
@@ -56,6 +51,39 @@ async function sendImmediate(text: string) {
     },
     () => { onDone() }
   )
+  chatStore.startStatusPoll(async () => {
+    try {
+      const st = await fetchStatus(sid)
+      if (st.status === 'completed') {
+        chatStore.stopStatusPoll()
+        chatStore.runStatus = 'completed'
+        chatStore.currentStep = ''
+        chatStore.isStreaming = false
+        chatStore.streamingText = ''
+        const d2 = await fetchHistory(sid)
+        chatStore.setMessages(d2.messages || [])
+      } else if (st.status === 'hitl_waiting') {
+        chatStore.runStatus = 'hitl_waiting'
+        chatStore.currentStep = ''
+        if (st.hitl) {
+          props.restore({
+            mode: st.hitl.mode as 'scope_select' | 'conflict_resolve' | 'direction_adjust',
+            session_id: sid,
+            options: st.hitl.options,
+            ts: new Date().toISOString(),
+          })
+        }
+      } else if (st.status === 'resuming') {
+        chatStore.runStatus = 'running'
+        chatStore.currentStep = st.current_step || '正在恢复执行中...'
+      } else if (st.status === 'running') {
+        chatStore.runStatus = 'running'
+        if (!chatStore.isStreaming) {
+          chatStore.currentStep = st.current_step
+        }
+      }
+    } catch { /* ignore */ }
+  })
 }
 
 async function send() {
@@ -70,7 +98,7 @@ async function send() {
   }
 
   if (sending.value) {
-    pending.value = text
+    chatStore.pendingQuery = text
     return
   }
 
@@ -83,10 +111,11 @@ async function send() {
     <input
       v-model="input"
       type="text"
-      placeholder="输入你的问题..."
+      :disabled="sending || chatStore.runStatus === 'running'"
+      :placeholder="chatStore.runStatus === 'running' ? '研究进行中，请等待...' : '输入你的问题...'"
       @keydown.enter="send"
     />
-    <button :disabled="sending || !input.trim()" @click="send">
+    <button :disabled="sending || !input.trim() || chatStore.runStatus === 'running'" @click="send">
       {{ sending ? '...' : '发送' }}
     </button>
   </div>

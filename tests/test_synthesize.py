@@ -1,5 +1,4 @@
 """synthesize 模块测试"""
-from src.synthesize.deduplicator import dedup_check
 from src.synthesize.ranker import rank_findings
 
 # ranker 测试

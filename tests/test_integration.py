@@ -51,21 +51,13 @@ rq = resolve_query("市场规模方面再说详细点", "已有调研")
 assert rq
 print(f"[PASS] planner: {rq[:30]}")
 
-# 9. extractor
-from src.extract.extractor import extract_from_content
-ex = extract_from_content("测试", "2025年AI Agent市场达100亿美元。主要应用客服领域。")
-assert ex["l0_summary"]
-assert len(ex["findings"]) > 0
-print("[PASS] extractor")
+# 9. page_brief
+from src.page_brief.brief import brief_from_page
+bp = brief_from_page("测试", "2025年AI Agent市场达100亿美元。主要应用客服领域。")
+assert len(bp["key_points"]) > 0
+print("[PASS] page_brief")
 
-# 10. dedup
-from src.synthesize.deduplicator import dedup_check
-# 用不重复的内容测试
-dc = dedup_check("这是一个唯一的测试内容" + "x" * 100 + str(hash("test")))
-assert not dc["is_duplicate"]
-print("[PASS] dedup")
-
-# 11. ranker
+# 10. ranker (原 11)
 from src.synthesize.ranker import rank_findings
 rf = rank_findings("AI", [{"topic": "市场", "content": "AI市场规模"}])
 assert len(rf) == 1

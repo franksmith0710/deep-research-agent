@@ -1,0 +1,539 @@
+ 
+╔══════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                          Deep Research Agent — 完整流程图（基于实际代码 v2.1）                      ║
+╚══════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+  全图共 18 节点（15 functional + 3 HITL）、4 条意图路径、3 个 HITL 中断点、1 个搜索回环（仅 deep_research）
+
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │                                            入口                                              │
+  │                                    query + session_id                                       │
+  └──────────────────────────────────────────┬───────────────────────────────────────────────────┘
+                                             │
+                                             ▼
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ ① resolve_context （指代消解 + 口语改写 + BGE 语义兜底）                                       │
+  │  输入: query, session_id → 读最近 10 条任务 L0 摘要 → resolve_query()                        │
+  │  输出: resolved_query（改写后与 query 余弦 < 0.2 时回退原话，防止 LLM 改写跑偏）               │
+  └──────────────────────────────────────────┬───────────────────────────────────────────────────┘
+                                             │
+                                             ▼
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ ② intent_classifier （意图分类 — 4 分支路由）                                                    │
+  │  输入: resolved_query, sections(已有章节), deep_search_count                                   │
+  │  流程: LLM chat_json 判断用户意图                                                              │
+  │  输出: intent + refine_section_name(仅 refine/new_search_topic)                              │
+  └──────────────────────────────────────────┬───────────────────────────────────────────────────┘
+                                             │
+                         ┌───────────────────┼───────────────────────────┐
+                         │                   │                           │
+                     simple_llm          deep_research               refine_section
+                      (不搜索)         (全新话题深度调研)            new_search_topic
+                          │             (多轮搜索回环)            (新方面, 跳过assess)
+                         │                   │                           │
+                         ▼                   ▼                           ▼
+               ┌─────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐
+               │ simple_llm_node  │   │ ③ check_history     │   │ ③ check_history     │
+               │ 直接LLM回答      │   │   检索长期记忆       │   │   检索长期记忆       │
+               │ 不搜索不写记忆   │   │   retrieve_l1()     │   │   retrieve_l1()     │
+               └────────┬────────┘   │   LLM选相关→合并    │   │   LLM选相关→合并    │
+                        │            └──────────┬──────────┘   └──────────┬──────────┘
+                        ▼                       │                        │
+               ┌─────────────────┐              ▼                        ▼
+               │ ⑱ memory_llm   │   ┌─────────────────────┐   ┌─────────────────────┐
+               │  写聊天记录     │   │ ④ planner           │   │ ④ planner           │
+               └────────┬────────┘   │   generate_sub_que- │   │   新 sub_queries    │
+                        │            │   ries() 生成子查询  │   └──────────┬──────────┘
+                        ▼            │   LLM评估need_adjust│              │
+                       END           └──────────┬──────────┘              │
+                                                │                        │
+                                  ┌─────────────┼─────────────┐          │
+                                  │             │             │          │
+                            need_adjust   refine_section    deep_research
+                            =true                          / new_search_topic
+                                  │             │             │
+                                  ▼             ▼             ▼
+                         ┌──────────────┐  ┌──────────┐  ┌──────────────┐
+                         │⑤ hitl_adjust │  │          │  │ ⑥ clarify    │
+                         │  HITL中断     │  │          │  │  判断是否需要 │
+                         │ 编辑子查询    │  │          │  │  范围补充    │
+                         └──────┬───────┘  │          │  └──────┬───────┘
+                                │          │          │         │
+                                └────→─────┼──────────┼─────────┼──────────┐
+                                           │          │         │          │
+                                           │          │  ┌──────┴──────┐   │
+                                           │          │  │ need_scope  │   │
+                                           │          │  │ =true       │ no│
+                                           │          │  │             │   │
+                                           │          │  ▼             ▼   │
+                                           │          │ ┌──────────┐       │
+                                           │          │ │⑦hitl_scope│      │
+                                           │          │ │ HITL中断  │      │
+                                           │          │ │选择维度   │      │
+                                           │          │ └────┬─────┘      │
+                                           │          │      │            │
+                                           └────→─────┼──────┴────────────┘
+                                                      │
+                                                      ▼
+                                           ┌─────────────────────┐
+                                           │ ⑧ search            │
+                                           │  优先 MetasoSearch  │
+                                           │  fallback DuckDuckGo│
+                                           │  多线程 5 并行       │
+                                           │  每 query 取 3 条   │
+                                            │  全失败→原始query   │
+                                            │  再搜一次           │
+                                           └──────────┬──────────┘
+                                                      │
+                                                      ▼
+                                           ┌─────────────────────┐
+                                           │ ⑨ scrape            │
+                                           │  多线程抓取 5 页     │
+                                           │  失败→降级snippet   │
+                                           │  记录来源可信度     │
+                                           └──────────┬──────────┘
+                                                      │
+                                                      ▼
+                                           ┌─────────────────────┐
+│ ⑩ context_mgr       │
+│  跳过<100字符页     │
+│  rerank过滤不相关   │
+│  <0.2的丢弃         │
+│  brief_from_page()  │
+│  提取关键要点       │
+                                           └──────────┬──────────┘
+                                                      │
+                                                      ▼
+                                           ┌─────────────────────┐
+                                           │ ⑪ dedup_rerank      │
+                                           │  批量embedding      │
+                                           │  余弦≥0.88去重      │
+                                           │  rank_findings()    │
+                                           │  过滤<0.3的         │
+                                           │  findings累加不丢失 │
+                                           └──────────┬──────────┘
+                                                      │
+                           ┌───────────────────────────┼───────────────────────────┐
+                           │                           │                           │
+                     refine_section              deep_research
+                     new_search_topic
+                     (跳过assess)                     │
+                           │                          ▼
+                           │              ┌─────────────────────┐
+                           │              │ ⑫ assess            │
+                           │              │  LLM评估覆盖率      │
+                           │              │  冲突检测+自动裁决  │
+                           │              └──────────┬──────────┘
+                           │                         │
+                           │              ┌──────────┴──────────┐
+                           │              │          │          │
+                            │         has_conflict  coverage<60  coverage>=60
+                            │         =true          && round<3
+                           │              │          │          │
+                           │              ▼          ▼          │
+                           │      ┌────────────┐ ┌──────┐       │
+                           │      │⑬hitl_conf │ ⑧search │       │
+                           │      │lict        │  (回环) │       │
+                           │      │ HITL中断   │ └──┬───┘       │
+                           │      │ 或自动裁决  │    │           │
+                           │      └─────┬──────┘    │           │
+                           │            │      ┌────┴────┐      │
+                           │            │      │ 又一轮   │      │
+                           │            │      │ search→  │      │
+                           │            │      │ scrape→  │      │
+                           │            │      │ ctx→     │      │
+                           │            │      │ dedup    │      │
+                           │            │      └────┬────┘      │
+                           │            │           │           │
+                           │            │           ▼           │
+                           │            │     ┌────────────┐    │
+                           │            │     │ assess(again│   │
+                           │            │     │ 直到≥60或  │    │
+                           │            │     │ round≥3    │    │
+                           │            │     └──────┬─────┘    │
+                           │            │            │          │
+                           └────→───────┼────────────┼──────────┘
+                                        │            │
+                                        ▼            ▼
+                             ┌──────────────────────────────────────────────┐
+                             │ ⑭ synthesize     （统一综合节点，只执行一次）    │
+                             │                                              │
+                             │  ① _llm_fallback=true且无findings→直接LLM回答│
+                             │    （搜索全失败降级）                          │
+                             │  ② 无findings → 返回空 sections               │
+                             │  ③ 有findings → 确定 turn_topic               │
+                             │                                              │
+                             │  旧bug：每轮assess后都执行synthesize→覆盖丢失   │
+                             │  已修复：只执行一次，findings在dedup累加       │
+                             └─────────────────────┬────────────────────────┘
+                                                   │
+                                                   ▼
+                                             ┌──────────────────────────────┐
+                                             │ ⑮ report   （流式生成）      │
+                                             │                              │
+                                             │  _llm_fallback有sections→    │
+                                             │   直接使用合成的回答          │
+                                             │  refine_section→             │
+                                             │   单章大纲→generate_report   │
+                                             │  new_search_topic→           │
+                                             │   单章大纲→追加              │
+                                             │  deep_research→              │
+                                             │   完整大纲→流式生成          │
+                                             │  构建脚注(来源+可信度标签)   │
+                                             └──────────────┬───────────────┘
+                                                            │
+                                                            ▼
+                                             ┌──────────────────────────────┐
+                                              │ ⑯ memory     （两阶段持久化） │
+                                              │  阶段1（PostgreSQL 表）：     │
+                                              │  ├ update_task(status+报告+  │
+                                              │  │   l0_summary)             │
+                                              │  └ insert_chat_message(历史) │
+                                              │  阶段2（长期记忆 L1）：      │
+                                              │  └ extract_knowledge→        │
+                                              │     fs.write→fs_nodes表     │
+                                             └──────────────┬───────────────┘
+                                                            │
+                                                            ▼
+                                                           END
+
+
+╔══════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                            路由条件明细（每条边的触发条件）                                        ║
+╚══════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ route_by_intent(intent_classifier → )                                                        │
+  │  ├ intent in (deep_research, refine_section, new_search_topic) → check_history              │
+  │  └ else → simple_llm                                                                        │
+  │                                                                                              │
+   │ route_after_planner(planner → )                                                              │
+   │  ├ intent == refine_section → search（跳过 clarify，也跳过 hitl_adjust）                      │
+   │  ├ need_adjust = true → hitl_adjust                                                         │
+   │  └ else (deep_research / new_search_topic) → clarify                                        │
+  │                                                                                              │
+  │ clarify → lambda:                                                                           │
+  │  ├ need_scope = true → hitl_scope                                                           │
+  │  └ else → search                                                                            │
+  │                                                                                              │
+  │ route_after_rerank(dedup_rerank → )                                                          │
+  │  ├ intent in (refine_section, new_search_topic) → synthesize（跳过 assess）                  │
+  │  └ else → assess                                                                            │
+  │                                                                                              │
+   │ route_assess(assess → )                                                                      │
+   │  ├ has_conflict = true → hitl_conflict                                                       │
+   │  ├ _llm_fallback = true → synthesize                                                         │
+   │  ├ sufficient = true → synthesize                                                            │
+   │  ├ intent != deep_research → synthesize（防御：此分支实际已被 route_after_rerank 拦截）        │
+   │  ├ coverage < 60 AND round < 3 → search（回环，仅 deep_research）                            │
+   │  └ else → synthesize                                                                        │
+  │                                                                                              │
+  │ synthesize → report（直连）                                                                   │
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+╔══════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                           特殊路径标注                                                           ║
+╚══════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+  ◆ query 改写熔断路径（新功能）
+    resolve_context_node → resolve_query(query, session_history) →
+    LLM 消解指代 + 口语→专业改写 →
+    BGE 余弦相似度对比 query vs resolved_query：
+      ① 相似度 ≥ 0.2 → 保留改写结果
+      ② 相似度 < 0.2 → 回退用户原话，防止 LLM 改写跑偏全链路
+
+  ◆ _llm_fallback 降级路径（搜索全失败时）
+    search_node 标记 search_all_failed=true →
+    assess_node 检测 search_all_failed 且 findings 为空 →
+    立即标记 _llm_fallback=true →
+    route_assess 检测 _llm_fallback → 直接走 synthesize →
+    synthesize 调用 LLM 直接回答（用自身知识）→
+    report_node 检测到 sections 中有内容，直接输出
+
+  ◆ 自动冲突裁决路径（assess 内部）
+    assess_node 检测到 has_conflict=true →
+    收集冲突方来源URL + 可信度评分 →
+    使用已有 scraped_pages 原文 + LLM 事实核查 →
+    ① 能裁决 → 自动消解，has_conflict=false
+    ② 不能裁决 → has_conflict=true，触发 hitl_conflict HITL
+
+  ◆ 路径差异对比表
+
+    ┌─────────────────┬──────────────┬──────────────┬──────────────────┬──────────────┐
+    │                 │ deep_research │refine_section│ new_search_topic │ simple_llm   │
+    ├─────────────────┼──────────────┼──────────────┼──────────────────┼──────────────┤
+    │ resolve_context │  ✓           │  ✓           │  ✓               │  ✓           │
+    │ intent_classify │  ✓           │  ✓           │  ✓               │  ✓           │
+    │ check_history   │  ✓           │  ✓           │  ✓               │  ✗           │
+    │ planner         │  ✓           │  ✓           │  ✓               │  ✗           │
+    │ clarify         │  ✓           │  ✗(跳过)     │  ✓               │  ✗           │
+    │ assess          │  ✓(多轮回环) │  ✗(跳过)     │  ✗(跳过)         │  ✗           │
+    │ 搜索循环        │  ✓(最多3轮)  │  ✗           │  ✗               │  ✗           │
+    │ synthesize      │  ✓(1次)      │  ✓(1次)      │  ✓(1次)          │  ✗           │
+    │ memory          │  ✓           │  ✓           │  ✓               │ ✗(memory_llm)│
+    └─────────────────┴──────────────┴──────────────┴──────────────────┴──────────────┘
+
+
+╔══════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                    每个节点详细说明（"每个阶段在干嘛"）                                          ║
+╚══════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 阶段一：查询预处理                                                                                │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                  │
+│ ① resolve_context_node                                                                          │
+│   文件: src/agent/nodes.py:195                                                                   │
+│   作用: 指代消解 + 口语→专业改写 + BGE 语义兜底。三合一 query 预处理。                             │
+│         ① 读取当前 session 最近 10 条任务的 L0 摘要，调用 resolve_query() 解析指代词                  │
+│            （"它"→"固态电池"、"这个方案"→"量子纠错方案"）                                         │
+│         ② LLM 将口语化/模糊表达改写为专业搜索查询                                                   │
+│            （"现在做到啥程度了"→"当前技术成熟度与产业化进展"）                                      │
+│         ③ BGE 余弦相似度对比 query vs resolved_query，< 0.2 时回退原话                             │
+│            （"天气怎么样"→"量子计算编译器设计" → 余弦≈0.05 → 回退 ✅）                             │
+│   关键调用: resolve_query(query, session_history) → _cosine_sim(embed_query)                     │
+│   输出字段: resolved_query                                                                       │
+│                                                                                                  │
+│ ② intent_classifier_node                                                                        │
+│   文件: src/agent/nodes.py:208                                                                   │
+│   作用: 意图分类。调用 LLM chat_json 判断用户意图，决定走哪条执行路径。                               │
+│         考虑因素：已有报告章节、已使用的搜索轮次。                                                   │
+│   关键调用: chat_json(_INTENT_PROMPT) → 返回 {intent, reason, section_name}                      │
+│   输出字段: intent, refine_section_name(仅refine/new_search_topic时)                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 阶段二：历史记忆检查                                                                               │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                  │
+│ ③ check_history_node                                                                           │
+│   文件: src/agent/nodes.py:230                                                                   │
+│   作用: 检索长期记忆。从 Viking FS 的 user/memories 中检索与当前查询相关的历史记忆（L1级别），       │
+│         调用 LLM 判断哪些条目相关，合并到 findings 列表中。                                        │
+│   关键调用: retrieve_l1(query, limit) → LLM 筛选 related_indices                                 │
+│   输出字段: findings（追加历史记忆条目，每条含 content, source_url, topic）                        │
+│   注意: 仅 deep_research / refine_section / new_search_topic 走此节点                             │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 阶段三：研究规划                                                                                  │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                  │
+│ ④ planner_node                                                                                  │
+│   文件: src/agent/nodes.py:283                                                                   │
+│   作用: 生成子搜索查询。调用 generate_sub_queries() 将 resolved_query 拆解为多个具体子问题，            │
+│         再用 LLM 判断子查询是否精准、是否需要用户调整方向。                                         │
+│   关键调用: generate_sub_queries(resolved_query) → chat_json(_ADJUST_PROMPT)                     │
+│   输出字段: sub_queries, need_adjust                                                             │
+│   注意: generate_sub_queries 不再校验语义，校验已收敛到 resolve_query（阶段一）                      │
+│   旧bug: refine_section 曾跳过 planner → sub_queries 是旧的（已修复）                              │
+│                                                                                                  │
+│ ⑤ hitl_adjust_node (HITL)                                                                      │
+│   文件: src/agent/nodes.py:922                                                                   │
+│   作用: 人机交互—方向微调。interrupt 暂停图执行，等待用户编辑/确认子查询列表。                        │
+│         用户不确认则不继续执行。                                                                    │
+│   触发条件: planner 返回 need_adjust=true                                                          │
+│   输出字段: sub_queries（用户修改后）, need_adjust=false                                          │
+│   完成后: → clarify_node                                                                         │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 阶段四：范围确认                                                                                  │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                  │
+│ ⑥ clarify_node                                                                                 │
+│   文件: src/agent/nodes.py:267                                                                   │
+│   作用: 判断是否需要用户补充研究范围。基于查询本身判断范围是否明确，建议可选的调研维度。              │
+│   关键调用: need_clarification(resolved_query) → {need_scope, suggested_dimensions}               │
+│   输出字段: need_scope, scope.suggested_dimensions                                               │
+│   注意: refine_section 跳过此节点（直接 search）                                                   │
+│                                                                                                  │
+│ ⑦ hitl_scope_node (HITL)                                                                       │
+│   文件: src/agent/nodes.py:902                                                                   │
+│   作用: 人机交互—范围选择。interrupt 暂停图执行，等待用户选择调研维度（复选+自定义文本）。              │
+│         选择后根据选中的维度过滤子查询，避免重新规划浪费一轮搜索。                                     │
+│   触发条件: clarify 返回 need_scope=true                                                           │
+│   输出字段: sub_queries（按选中维度过滤）, need_scope=false                                       │
+│   完成后: → search_node                                                                          │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 阶段五：搜索执行                                                                                  │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                  │
+│ ⑧ search_node                                                                                   │
+│   文件: src/agent/nodes.py:319                                                                   │
+│   作用: 多引擎搜索。优先 MetasoSearch（主引擎），全部失败后 fallback 到 DuckDuckGoSearch（备用引擎）。│
+│         多线程并行执行最多 5 个子查询，每个取前 3 条结果。标记是否搜索全部失败。                      │
+│   关键逻辑:                                                                                       │
+│     _try_engine(MetasoSearch) → 失败 → _try_engine(DuckDuckGo) → 失败 → 原始 query 再搜一次      │
+│   输出字段: search_results(标题+URL+snippet), search_all_failed, deep_search_count+1（仅deep_research）│
+│   回环: 仅 deep_research 走 assess 回环时重新进入此节点（用新 sub_queries）                         │
+│                                                                                                  │
+│ ⑨ scrape_node                                                                                   │
+│   文件: src/agent/nodes.py:387                                                                   │
+│   作用: 网页抓取。多线程并行抓取搜索结果中的 URL（最多 5 页），提取完整页面内容。                       │
+│         抓取失败时降级使用 search snippet，记录来源可信度。                                           │
+│   关键调用: Scraper.scrape(url) → update_source_credibility(url, success)                        │
+│   输出字段: scraped_pages（按 URL 去重，由 _merge_pages reducer 保证不重复）                       │
+│   降级: 抓取失败但有 snippet → 用 snippet 代替内容；抓取失败且无 snippet → 空内容 + success=false  │
+│                                                                                                  │
+│ ⑩ context_mgr_node                                                                              │
+│   文件: src/agent/nodes.py:436                                                                   │
+│   作用: 上下文管理。提取关键要点并过滤无关/过短页面。                                                │
+│   关键流程:                                                                                       │
+│     ① 跳过内容 < 100 字符的过短页面                                                               │
+│     ② 本地 reranker 过滤不相关内容（余弦相似度 < 0.2 的丢弃）                                      │
+│     ③ brief_from_page() 提取关键点 → key_points(topic + content)                                │
+│   关键调用: rerank(query, text) → threshold 0.2 → brief_from_page(title, content)                │
+│   输出字段: page_summaries（追加到已有列表，每条含 url, title, topic, key_points_json, page_abstract, findings）   │
+│                                                                                                  │
+│ ⑪ dedup_rerank_node                                                                             │
+│   文件: src/agent/nodes.py:482                                                                   │
+│   作用: 合并去重+重排序。先对 findings 做语义去重，再按相关性重排。                                   │
+│   关键流程:                                                                                       │
+│     ① 批量 embedding(embed_text) 所有新 findings + 已有 findings                                 │
+│     ② 余弦相似度 ≥ 0.88 → 视为重复，丢弃                                                          │
+│     ③ rank_findings() 按相关性排序，过滤 < 0.3 的条目                                             │
+│   关键调用: embed_text(batch) → torch cosine_similarity(threshold=0.88) → rank_findings(top_k=15)│
+│   输出字段: findings（累加！旧 content 不被覆盖，新内容按质量过滤追加）                                │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 阶段六：覆盖度评估                                                                                │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                  │
+  │ ⑫ assess_node                                                                                   │
+  │   文件: src/agent/nodes.py:531                                                                   │
+  │   作用: 评估信息覆盖度，检测信息冲突，决定是否继续搜索。                                            │
+  │   关键流程:                                                                                       │
+  │     ① LLM 评估覆盖率(0-100)、检测冲突                                                             │
+  │     ② 搜索全失败且 findings 为空 → 标记 _llm_fallback=true（立即跳 synthesize LLM 回答）           │
+  │     ③ 检测到冲突 → 自动裁决流程：                                                                 │
+  │        a. 收集冲突方来源 URL + 可信度评分（get_credibility）                                       │
+  │        b. 使用已有 scraped_pages 原文                                                             │
+  │        c. LLM 事实核查（对比可信度、逻辑一致性、数据支撑）                                         │
+  │        d. 能裁决→自动消解；不能→保持冲突状态→触发 HITL                                            │
+  │     ④ 搜索全失败时 LLM 仍会基于 query 生成新大纲+新子查询，重新规划下一轮搜索方向                   │
+  │   关键调用: chat_json(_ASSESS_PROMPT) → resolve_conflict LLM                                      │
+  │   输出字段: coverage_score, has_conflict, conflict_description, sub_queries(新子查询),            │
+  │             assess_round+1, _llm_fallback(搜索全失败时)                                           │
+│   路由: 见上方"路由条件明细"                                                                       │
+│                                                                                                  │
+│ ⑬ hitl_conflict_node (HITL)                                                                     │
+│   文件: src/agent/nodes.py:935                                                                   │
+│   作用: 人机交互—冲突采信。interrupt 暂停图执行，等待用户选择采信哪方观点或并列显示。                  │
+│   触发条件: assess 检测到冲突且自动裁决失败                                                         │
+│   输出字段: has_conflict=false, conflict_resolution(用户选择)                                     │
+│   完成后: → synthesize_node                                                                      │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 阶段七：综合准备                                                                                  │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                  │
+│ ⑭ synthesize_node                                                                               │
+│   文件: src/agent/nodes.py:675                                                                   │
+│   作用: 准备 findings 和话题，处理 LLM fallback 降级。                                              │
+│   关键流程:                                                                                       │
+│     ① _llm_fallback=true 且无 findings → 调用 LLM 直接回答（搜索全失败降级）                      │
+│     ② 无 findings 且非 fallback → 返回空 sections                                                │
+│     ③ 有 findings → 根据 intent 确定 turn_topic                                                │
+│   输出字段: sections(仅fallback时), turn_topic                                                     │
+│   注意: 实际 LLM 内容生成已移到 report_node，正常路径只做准备工作                                    │
+│   旧bug: 每轮 assess 后都执行 synthesize → sections 被覆盖丢失 → 已修复                              │
+│                                                                                                  │
+
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 阶段八：报告生成                                                                                  │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                  │
+│ ⑮ report_node (async)                                                                          │
+│   文件: src/agent/nodes.py:733                                                                   │
+│   作用: 统一流式报告生成。所有意图路径都流式输出，每轮生成独立内容。                                  │
+│   关键流程:                                                                                       │
+│     ① _llm_fallback 有 sections → 直接用 synthesize 的回答（不调用 LLM 生成）                     │
+│     ② refine_section / new_search_topic → 单章大纲→generate_report_stream()                      │
+│     ③ deep_research → 完整大纲（无则生成）→ generate_report_stream()                              │
+│     ④ _build_footnotes() 构建脚注：来源URL + 可信度标签 + 内容预览（200字）                        │
+│     ⑤ 构建累积报告（已有报告 + "\n\n---\n\n" + 本轮报告）                                        │
+│   关键调用: generate_report_stream(query, outline, findings, on_token) → 流式 callback           │
+│   输出字段: report(累积), turn_report(本轮), sections, outline, _report_streamed                 │
+│   流式: 通过 stream_callback_var 推送 token 到前端 SSE                                           │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 阶段九：记忆持久化                                                                                │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                  │
+│ ⑯ memory_node                                                                                   │
+│   文件: src/agent/nodes.py:831                                                                   │
+│   作用: 两阶段持久化：L0 压缩 + 写表 + 长期记忆（L1）。                                           │
+│                                                                                                  │
+│   阶段1（PostgreSQL 表）：                                                                       │
+│     ├ _compress_l0(query, report) LLM 压缩 query+report ≤100 字                                   │
+│     ├ update_task(task_id, status="completed", report, l0_summary) → research_tasks 表            │
+│     └ insert_chat_message(session_id, "assistant", turn_report) → chat_history 表                 │
+│                                                                                                  │
+│   阶段2（长期记忆 — PostgreSQL fs_nodes 表）：                                                    │
+│     └ _write_long_term_memory(session_id, task_id, report):                                       │
+│         └ memory_update() → extract_knowledge() 从报告提取 3-5 条知识                              │
+│           → vector search 相似度匹配 → fs.write() → fs_nodes 表（仅报告≥200字符时）              │
+│                                                                                                  │
+│   输出字段: status="completed" → END                                                             │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 额外节点（simple_llm 路径专用）                                                                     │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                                  │
+│ ⑰ simple_llm_node                                                                               │
+│   文件: src/agent/nodes.py:866                                                                   │
+│   作用: 简单 LLM 回答。不搜索、不写记忆，直接基于已有报告+对话历史回答。                             │
+│   触发条件: intent="simple_llm"                                                                  │
+│   关键调用: chat(_SIMPLE_LLM_PROMPT.format(report, history, query))                              │
+│   输出字段: report(答案内容), status="completed"                                                  │
+│   适用场景: 总结/改写/追问细节/实时信息查询                                                         │
+│                                                                                                  │
+│ ⑱ memory_llm_node                                                                               │
+│   文件: src/agent/nodes.py:891                                                                   │
+│   作用: 轻量版持久化。仅写 chat_history，不写长期记忆（L1）。                                         │
+│   输出字段: status="completed" → END                                                             │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+╔══════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                           修改历史对比（旧bug → 已修复 / 新功能）                                  ║
+╚══════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Bug 1: refine_section 跳过 planner → sub_queries 是旧的                                       │
+  │ 修复: 走 planner → 生成新 sub_queries（但跳过 clarify → 直接 search）                          │
+  │                                                                                              │
+  │ Bug 2: clarify 在 search 之后执行 → 范围确认失去意义                                            │
+  │ 修复: clarify 提前到 search 之前 → 先确定范围再搜索                                            │
+  │                                                                                              │
+  │ Bug 3: 每轮 assess 后都执行 synthesize → sections 被覆盖丢失（key 重复）                        │
+  │ 修复: synthesize 只执行一次（在 assess 回环结束后）                                            │
+  │       findings 在 dedup_rerank 累加，不丢失                                                   │
+  │                                                                                              │
+  │ Bug 4: hitl_adjust 后浪费一轮 search（因为 clarify 在 search 后面）                             │
+  │ 修复: hitl_adjust → clarify → search，不再浪费                                               │
+  │                                                                                              │
+  │ Bug 5: MetasoSearch 返回空 snippet → 影响页面质量评分                                         │
+  │ 修复: DuckDuckGoSearch 返回 snippet 字段，不再为空                                            │
+  │                                                                                              │
+  │ ———————————————————————————————————————————————————————————————————————————————              │
+  │                                                                                              │
+  │ 优化 6: new_search_topic 走 assess 但不回环 → 空转一次 LLM                                     │
+  │ 修复: new_search_topic 跳过 assess（和 refine_section 一致），省掉 1 次 LLM 调用               │
+  │                                                                                              │
+  │ 优化 7: resolve_query 只消歧不改写 → 口语 query 喂给下游 LLM 降低质量                           │
+  │ 修复: prompt 增加「口语→专业改写」指令，输出专业搜索查询                                        │
+  │                                                                                              │
+  │ 优化 8: resolve_query 改写无校验 → LLM 改写跑偏后全链路漂移                                   │
+  │ 修复: 改写后 BGE 余弦相似度校验，< 0.2 回退用户原话                                           │
+  │       阈值 0.2 仅拦截数量级级别跑偏（"天气"→"量子编译"），合法消歧正常放行                        │
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

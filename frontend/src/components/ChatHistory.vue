@@ -42,9 +42,19 @@ watch([() => chatStore.messages.length, throttledScroll, () => chatStore.chainEv
       <div v-else class="bubble">{{ msg.content }}</div>
     </div>
 
-    <div v-if="chatStore.currentEvent" class="current-step">
+    <div v-if="chatStore.runStatus === 'hitl_waiting'" class="current-step">
+      <span class="step-dot pulse"></span>
+      <span class="step-text">等待用户确认中...</span>
+    </div>
+
+    <div v-else-if="chatStore.currentEvent" class="current-step">
       <span class="step-dot pulse"></span>
       <span class="step-text">{{ chatStore.currentEvent.content }}</span>
+    </div>
+
+    <div v-else-if="chatStore.runStatus === 'running' && chatStore.currentStep" class="current-step">
+      <span class="step-dot pulse"></span>
+      <span class="step-text">{{ chatStore.currentStep }}</span>
     </div>
 
     <div v-if="chatStore.allEvents.length > 1" class="step-history">
@@ -56,7 +66,7 @@ watch([() => chatStore.messages.length, throttledScroll, () => chatStore.chainEv
           v-for="(ev, i) in chatStore.allEvents"
           :key="i"
           class="thinking-step"
-          :class="{ latest: i === chatStore.allEvents.length - 1 }"
+          :class="{ latest: i === chatStore.allEvents.length - 1 && chatStore.runStatus === 'running' }"
         >
           <span class="step-dot"></span>
           <span class="step-text">{{ ev.content }}</span>
@@ -150,6 +160,12 @@ watch([() => chatStore.messages.length, throttledScroll, () => chatStore.chainEv
   border-radius: 50%;
   background: #1976d2;
   animation: pulse 1.2s ease-in-out infinite;
+}
+.current-step .step-dot.done {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4caf50;
 }
 
 .step-history {

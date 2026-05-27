@@ -11,7 +11,7 @@ logger = get_logger("search")
 class DuckDuckGoSearch(SearchEngine):
     """封装 ddgs 包（DuckDuckGo 最新官方 SDK）。"""
 
-    def __init__(self, timeout: float = 15.0) -> None:
+    def __init__(self, timeout: float = 5.0) -> None:
         self._timeout = timeout
 
     def search(self, query: str, num_results: int = 3) -> list[SearchResultItem]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -203,19 +204,6 @@ def delete_session_data(session_id: str) -> None:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT task_id FROM research_tasks WHERE session_id = %s",
-                    (session_id,),
-                )
-                task_ids = [row[0] for row in cur.fetchall()]
-            if task_ids:
-                placeholders = ",".join(["%s"] * len(task_ids))
-                with conn.cursor() as cur:
-                    cur.execute(
-                        f"DELETE FROM memory_store WHERE task_id IN ({placeholders})",
-                        tuple(task_ids),
-                    )
-            with conn.cursor() as cur:
-                cur.execute(
                     "DELETE FROM chat_history WHERE session_id = %s",
                     (session_id,),
                 )
@@ -224,170 +212,192 @@ def delete_session_data(session_id: str) -> None:
                     "DELETE FROM research_tasks WHERE session_id = %s",
                     (session_id,),
                 )
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM fs_nodes WHERE context_type = 'session' AND uri LIKE %s",
+                    (f"viking://session/{session_id}/%",),
+                )
             conn.commit()
         finally:
             _pool.putconn(conn)
 
 
-# ── memory_store ──────────────────────────────────────────────────────
-
-def insert_memory(
-    task_id: int,
-    level: str,
-    content: str,
-    source_url: str | None = None,
-    topic: str | None = None,
-    embedding: list[float] | None = None,
-) -> int:
-    with _pool.getconn() as conn:
-        register_vector(conn)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """INSERT INTO memory_store (task_id, level, content, source_url, topic, embedding)
-                       VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
-                    (task_id, level, content, source_url, topic, embedding),
-                )
-                row = cur.fetchone()
-                conn.commit()
-                return row[0] if row else -1
-        finally:
-            _pool.putconn(conn)
+# ====================================================================
+# fs_nodes CRUD（Viking 文件系统持久化层）
+# ====================================================================
 
 
-def update_memory(id: int, content: str) -> None:
-    with _pool.getconn() as conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE memory_store SET content = %s, created_at = NOW() WHERE id = %s",
-                    (content, id),
-                )
-                conn.commit()
-        finally:
-            _pool.putconn(conn)
-
-
-def search_memory_by_vector(
-    query_embedding: list[float], limit: int = 5, min_score: float = 0.7
-) -> list[dict[str, Any]]:
-    """pgvector HNSW 余弦相似度搜索"""
-    with _pool.getconn() as conn:
-        register_vector(conn)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """WITH scored AS (
-                           SELECT id, task_id, content, source_url, topic,
-                                  1 - (embedding <=> %s::vector) AS similarity
-                           FROM memory_store
-                           WHERE level = 'L1' AND embedding IS NOT NULL
-                       )
-                       SELECT * FROM scored
-                       WHERE similarity >= %s
-                       ORDER BY similarity DESC
-                       LIMIT %s""",
-                    (query_embedding, min_score, limit),
-                )
-                return _dict_rows(cur)
-        finally:
-            _pool.putconn(conn)
-
-
-def search_memory_by_topic(
-    query_embedding: list[float], topic: str, limit: int = 2
-) -> list[dict[str, Any]]:
-    """按 topic 精确过滤 + pgvector 余弦相似度排序"""
-    with _pool.getconn() as conn:
-        register_vector(conn)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """WITH scored AS (
-                           SELECT id, task_id, content, source_url, topic,
-                                  1 - (embedding <=> %s::vector) AS similarity
-                           FROM memory_store
-                           WHERE level = 'L1' AND topic = %s AND embedding IS NOT NULL
-                       )
-                       SELECT * FROM scored
-                       ORDER BY similarity DESC
-                       LIMIT %s""",
-                    (query_embedding, topic, limit),
-                )
-                return _dict_rows(cur)
-        finally:
-            _pool.putconn(conn)
-
-
-def get_l2_by_url(source_url: str) -> list[dict[str, Any]]:
+def fs_get_node(uri: str) -> dict[str, Any] | None:
+    """按 URI 精确查找节点。"""
     with _pool.getconn() as conn:
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT * FROM memory_store WHERE level = 'L2' AND source_url = %s ORDER BY created_at DESC",
-                    (source_url,),
+                    "SELECT * FROM fs_nodes WHERE uri = %s",
+                    (uri,),
                 )
-                return cur.fetchall()
+                return cur.fetchone()
         finally:
             _pool.putconn(conn)
 
 
-def get_memories_by_task(task_id: int, level: str | None = None) -> list[dict[str, Any]]:
+def fs_get_children(parent_uri: str, recursive: bool = False) -> list[dict[str, Any]]:
+    """列出目录下的子节点。"""
     with _pool.getconn() as conn:
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                if level:
+                if recursive:
                     cur.execute(
-                        "SELECT * FROM memory_store WHERE task_id = %s AND level = %s",
-                        (task_id, level),
+                        """SELECT * FROM fs_nodes
+                           WHERE uri LIKE %s
+                           ORDER BY uri""",
+                        (parent_uri.rstrip("/") + "/%",),
                     )
                 else:
                     cur.execute(
-                        "SELECT * FROM memory_store WHERE task_id = %s",
-                        (task_id,),
+                        "SELECT * FROM fs_nodes WHERE parent_uri = %s ORDER BY name",
+                        (parent_uri,),
                     )
                 return cur.fetchall()
         finally:
             _pool.putconn(conn)
 
 
-# ── source_credibility ────────────────────────────────────────────────
+def fs_write_node(
+    uri: str,
+    parent_uri: str | None = None,
+    name: str = "",
+    is_directory: bool = False,
+    context_type: str = "user_memory",
+    level: str | None = "L1",
+    content: str | None = None,
+    abstract: str | None = None,
+    overview: str | None = None,
+    source_url: str | None = None,
+    metadata: dict | None = None,
+    embedding: list[float] | None = None,
+) -> int:
+    """写入或更新文件节点。存在则 UPDATE，否则 INSERT。"""
+    existing = fs_get_node(uri)
+    now = datetime.now(timezone.utc)
+    meta_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
 
-def upsert_credibility(url: str, domain: str, success: bool) -> None:
+    if existing:
+        with _pool.getconn() as conn:
+            register_vector(conn)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE fs_nodes SET
+                               parent_uri = %s, name = %s, is_directory = %s,
+                               context_type = %s, level = %s, content = %s,
+                               abstract = %s, overview = %s, source_url = %s,
+                               metadata = COALESCE(%s, metadata),
+                               embedding = %s, updated_at = %s
+                           WHERE uri = %s""",
+                        (parent_uri, name, is_directory,
+                         context_type, level, content,
+                         abstract, overview, source_url,
+                         meta_json, embedding, now, uri),
+                    )
+                    conn.commit()
+                return existing["id"]
+            finally:
+                _pool.putconn(conn)
+    else:
+        with _pool.getconn() as conn:
+            register_vector(conn)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO fs_nodes
+                               (uri, parent_uri, name, is_directory, context_type,
+                                level, content, abstract, overview, source_url,
+                                metadata, embedding, created_at, updated_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                           RETURNING id""",
+                        (uri, parent_uri, name, is_directory, context_type,
+                         level, content, abstract, overview, source_url,
+                         meta_json, embedding, now, now),
+                    )
+                    row = cur.fetchone()
+                    conn.commit()
+                    return row[0] if row else -1
+            finally:
+                _pool.putconn(conn)
+
+
+def fs_delete_node(uri: str, recursive: bool = False) -> bool:
+    """删除节点。recursive=True 删除所有子节点。"""
     with _pool.getconn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """INSERT INTO source_credibility (url, domain, score, access_count, last_status)
-                       VALUES (%s, %s, %s, 1, %s)
-                       ON CONFLICT (url) DO UPDATE SET
-                         access_count = source_credibility.access_count + 1,
-                         score = GREATEST(0, LEAST(100,
-                           source_credibility.score + CASE WHEN %s THEN 2 ELSE -5 END
-                         )),
-                         last_status = %s""",
-                    (
-                        url,
-                        domain,
-                        52 if success else 45,
-                        "success" if success else "fail",
-                        success,
-                        "success" if success else "fail",
-                    ),
-                )
+                if recursive:
+                    cur.execute(
+                        "DELETE FROM fs_nodes WHERE uri = %s OR uri LIKE %s",
+                        (uri, uri.rstrip("/") + "/%"),
+                    )
+                else:
+                    cur.execute(
+                        "DELETE FROM fs_nodes WHERE uri = %s",
+                        (uri,),
+                    )
                 conn.commit()
+                return cur.rowcount > 0
         finally:
             _pool.putconn(conn)
 
 
-def get_credibility(url: str) -> dict[str, Any] | None:
+def fs_search_by_vector(
+    query_embedding: list[float],
+    parent_uri: str | None = None,
+    limit: int = 10,
+    min_score: float = 0.0,
+) -> list[dict[str, Any]]:
+    """向量搜索指定前缀根目录下的节点。
+    
+    返回结果包含 _score 字段。
+    """
     with _pool.getconn() as conn:
+        register_vector(conn)
         try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT * FROM source_credibility WHERE url = %s",
-                    (url,),
-                )
-                return cur.fetchone()
+            with conn.cursor() as cur:
+                if parent_uri:
+                    cur.execute(
+                        """WITH scored AS (
+                               SELECT id, uri, parent_uri, name, is_directory,
+                                      context_type, level, content, abstract,
+                                      overview, source_url, metadata,
+                                      1 - (embedding <=> %s::vector) AS similarity,
+                                      created_at, updated_at
+                               FROM fs_nodes
+                               WHERE embedding IS NOT NULL
+                                 AND (uri = %s OR uri LIKE %s)
+                           )
+                           SELECT * FROM scored
+                           WHERE similarity >= %s
+                           ORDER BY similarity DESC
+                           LIMIT %s""",
+                        (query_embedding, parent_uri, parent_uri.rstrip("/") + "/%",
+                         min_score, limit),
+                    )
+                else:
+                    cur.execute(
+                        """WITH scored AS (
+                               SELECT id, uri, parent_uri, name, is_directory,
+                                      context_type, level, content, abstract,
+                                      overview, source_url, metadata,
+                                      1 - (embedding <=> %s::vector) AS similarity,
+                                      created_at, updated_at
+                               FROM fs_nodes
+                               WHERE embedding IS NOT NULL
+                           )
+                           SELECT * FROM scored
+                           WHERE similarity >= %s
+                           ORDER BY similarity DESC
+                           LIMIT %s""",
+                        (query_embedding, min_score, limit),
+                    )
+                return _dict_rows(cur)
         finally:
             _pool.putconn(conn)

@@ -6,7 +6,7 @@ const props = defineProps<{ hitl: ReturnType<typeof useHITL> }>()
 
 const selectedOptions = ref<string[]>([])
 const selectedChoice = ref<string>('')
-const outlineText = ref<string>('')
+
 const submitting = ref(false)
 
 const hitlMode = computed(() => props.hitl.currentHITL.value?.mode as string | undefined)
@@ -20,8 +20,6 @@ async function confirm() {
       data = { selectedDimensions: selectedOptions.value }
     } else if (hitlMode.value === 'conflict_resolve') {
       data = { selectedChoice: selectedChoice.value }
-    } else if (hitlMode.value === 'outline_edit') {
-      data = { outline: outlineText.value }
     } else if (hitlMode.value === 'direction_adjust') {
       data = { selectedSubQueries: selectedOptions.value }
     }
@@ -35,7 +33,7 @@ async function confirm() {
 function resetInputs() {
   selectedOptions.value = []
   selectedChoice.value = ''
-  outlineText.value = ''
+
 }
 </script>
 
@@ -75,11 +73,6 @@ function resetInputs() {
               <input type="checkbox" :value="sq" v-model="selectedOptions" /> {{ sq }}
             </label>
           </div>
-        </template>
-
-        <template v-else-if="hitlMode === 'outline_edit'">
-          <p>请调整报告大纲：</p>
-          <textarea v-model="outlineText" rows="6" class="outline-input" />
         </template>
 
         <template v-else>
@@ -124,16 +117,6 @@ function resetInputs() {
   cursor: pointer;
 }
 .hitl-body .options input { margin-right: 8px; }
-.outline-input {
-  width: 100%;
-  padding: 8px;
-  background: #f5f6f8;
-  color: #333;
-  border: 1px solid #ccc;
-  border-radius: 6px;
-  font-size: 13px;
-  resize: vertical;
-}
 .hitl-footer { text-align: right; display: flex; gap: 8px; justify-content: flex-end; }
 .hitl-footer button {
   padding: 8px 24px;

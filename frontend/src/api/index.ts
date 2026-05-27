@@ -21,8 +21,20 @@ export async function deleteSession(sessionId: string): Promise<void> {
 export async function fetchHistory(sessionId: string): Promise<{
   messages: ChatMessage[]
   report: string | null
+  status: string
 }> {
   const res = await fetch(`${BASE}/sessions/${sessionId}/history`)
+  return res.json()
+}
+
+export async function fetchStatus(sessionId: string): Promise<{
+  status: string
+  current_node: string
+  current_step: string
+  report: string
+  hitl?: { mode: string; options: Record<string, unknown> } | null
+}> {
+  const res = await fetch(`${BASE}/sessions/${sessionId}/status`)
   return res.json()
 }
 
@@ -42,13 +54,16 @@ export function researchSSE(
   xhr.setRequestHeader('Content-Type', 'application/json')
   xhr.responseType = 'text'
 
-  let buffer = ''
+  let cursor = 0
+  let lineBuf = ''
   let done = false
 
   xhr.onprogress = () => {
-    buffer += xhr.responseText.slice(buffer.length)
-    const parts = buffer.split('\n')
-    buffer = parts.pop() || ''
+    const chunk = xhr.responseText.slice(cursor)
+    cursor = xhr.responseText.length
+    lineBuf += chunk
+    const parts = lineBuf.split('\n')
+    lineBuf = parts.pop() || ''
     let currentEvent = ''
     for (const line of parts) {
       if (line.startsWith('event: ')) {
@@ -79,6 +94,54 @@ export function researchSSE(
 
   xhr.send(JSON.stringify({ query, session_id: sessionId }))
 
+  return { abort: () => xhr.abort() }
+}
+
+export function researchHITL_SSE(
+  sessionId: string,
+  mode: string,
+  data: Record<string, unknown>,
+  onEvent: (event: string, data: string) => void,
+  onError: (err: string) => void,
+  onDone: () => void,
+): SSEAbortable {
+  const xhr = new XMLHttpRequest()
+  xhr.open('POST', `${BASE}/hitl/callback`)
+  xhr.setRequestHeader('Content-Type', 'application/json')
+  xhr.responseType = 'text'
+
+  let cursor = 0
+  let lineBuf = ''
+  let done = false
+
+  xhr.onprogress = () => {
+    const chunk = xhr.responseText.slice(cursor)
+    cursor = xhr.responseText.length
+    lineBuf += chunk
+    const parts = lineBuf.split('\n')
+    lineBuf = parts.pop() || ''
+    let currentEvent = ''
+    for (const line of parts) {
+      if (line.startsWith('event: ')) {
+        currentEvent = line.slice(7).trim()
+      } else if (line.startsWith('data: ')) {
+        const dataStr = line.slice(6).trim()
+        if (currentEvent && dataStr) {
+          onEvent(currentEvent, dataStr)
+        }
+      }
+    }
+  }
+
+  xhr.onerror = () => { if (!done) { done = true; onError('连接失败') } }
+  xhr.onloadend = () => {
+    if (done) return
+    done = true
+    if (xhr.status >= 200 && xhr.status < 300) onDone()
+    else onError(`HTTP ${xhr.status}`)
+  }
+
+  xhr.send(JSON.stringify({ session_id: sessionId, mode, data }))
   return { abort: () => xhr.abort() }
 }
 
