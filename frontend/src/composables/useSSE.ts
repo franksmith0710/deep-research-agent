@@ -1,5 +1,4 @@
 import { ref } from 'vue'
-import type { Ref } from 'vue'
 import type { ChainEvent } from '../types'
 import { useChatStore } from '../stores/chatStore'
 

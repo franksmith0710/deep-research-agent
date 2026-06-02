@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
-import json
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -15,9 +13,11 @@ from src.db.postgres import (
     init_pool, get_all_sessions, get_task_by_session,
     get_chat_history, create_task, insert_chat_message,
     update_task, load_task_context, delete_session_data,
+    create_session_idle,
 )
 from src.agent.state import make_initial_state
 from src.agent.graph import build_graph
+from src.agent.nodes import cleanup_scraper
 from src.local_models.embedder import release_gpu as _release_embedder
 from src.local_models.reranker import release_gpu as _release_reranker
 from src.api.sse_manager import SSEManager
@@ -75,7 +75,6 @@ def _get_lock(session_id: str) -> asyncio.Lock:
 _NODE_DESCRIPTIONS = {
     "resolve_context": "正在理解你的问题",
     "intent_classifier": "正在分析研究意图",
-    "check_history": "正在检索历史记忆",
     "clarify": "正在判断是否需要补充信息（搜索前）",
     "planner": "正在规划搜索方向",
     "search": "正在搜索相关信息...",
@@ -83,11 +82,8 @@ _NODE_DESCRIPTIONS = {
     "context_mgr": "正在整理提炼内容",
     "dedup_rerank": "正在去重排序",
     "assess": "正在评估覆盖度",
-    "synthesize": "正在综合生成内容",
     "simple_llm": "正在直接回答问题",
     "hitl_scope": "等待你选择调研范围",
-    "hitl_adjust": "等待你调整搜索方向",
-    "hitl_conflict": "等待你确认信息冲突",
 }
 
 
@@ -132,6 +128,13 @@ def _detect_interrupt(node_output: Any) -> dict | None:
 @router.on_event("startup")
 async def startup():
     init_pool()
+
+
+@router.on_event("shutdown")
+async def shutdown():
+    cleanup_scraper()
+    _release_embedder()
+    _release_reranker()
 
 
 @router.get("/api/sessions")
@@ -188,6 +191,7 @@ async def get_session_status(session_id: str):
 async def create_session():
     import uuid
     session_id = str(uuid.uuid4())[:8]
+    create_session_idle(session_id)
     return {"session_id": session_id}
 
 
@@ -207,11 +211,15 @@ async def start_research(req: ResearchRequest):
         raise HTTPException(status_code=429, detail="该会话正在处理中，请等待")
     await lock.acquire()
 
-    ctx = load_task_context(req.session_id)
-    if ctx:
+    task = get_task_by_session(req.session_id)
+    if task and task.get("query"):
+        ctx = load_task_context(req.session_id)
         task_id = ctx["task_id"]
         update_task(task_id, status="running")
     else:
+        ctx = None
+        if task:
+            delete_session_data(req.session_id)
         task_id = create_task(req.session_id, req.query)
         update_task(task_id, status="running")
 
@@ -254,7 +262,7 @@ async def _run_agent(state: dict[str, Any], sse: SSEManager, lock: asyncio.Lock,
 
     graph = get_graph()
     config = {
-        "configurable": {"thread_id": session_id},
+        "configurable": {"thread_id": f"{session_id}_{state.get('task_id', '0')}"},
         "metadata": {
             "session_id": session_id,
             "query": state["query"][:100],
@@ -301,9 +309,14 @@ async def _run_agent(state: dict[str, Any], sse: SSEManager, lock: asyncio.Lock,
                             "options": interrupt_data.get("options", {}),
                         }
                         hitl_triggered = True
+                        await sse.put_hitl(interrupt_data.get("mode", "scope_select"), session_id, interrupt_data.get("options", {}))
                         t = asyncio.create_task(_cleanup_hitl_timeout(session_id, _HITL_TIMEOUT))
                         _hitl_cleanup_tasks[session_id] = t
                         return
+
+            elif kind == "on_chain_end" and name == "report":
+                _current_node.pop(session_id, None)
+                await sse.put_done()
 
             elif kind == "on_chain_end" and name == "DeepResearch":
                 output = event.get("data", {}).get("output", {}) or {}
@@ -315,6 +328,7 @@ async def _run_agent(state: dict[str, Any], sse: SSEManager, lock: asyncio.Lock,
                         "options": interrupt_data.get("options", {}),
                     }
                     hitl_triggered = True
+                    await sse.put_hitl(interrupt_data.get("mode", "scope_select"), session_id, interrupt_data.get("options", {}))
                     t = asyncio.create_task(_cleanup_hitl_timeout(session_id, _HITL_TIMEOUT))
                     _hitl_cleanup_tasks[session_id] = t
                     return
@@ -334,6 +348,7 @@ async def _run_agent(state: dict[str, Any], sse: SSEManager, lock: asyncio.Lock,
                     "options": interrupt_val.get("options", {}),
                 }
                 hitl_triggered = True
+                await sse.put_hitl(mode, session_id, interrupt_val.get("options", {}))
                 t = asyncio.create_task(_cleanup_hitl_timeout(session_id, _HITL_TIMEOUT))
                 _hitl_cleanup_tasks[session_id] = t
                 return
@@ -472,9 +487,14 @@ async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, 
                             "options": interrupt_data.get("options", {}),
                         }
                         hitl_triggered = True
+                        await sse.put_hitl(interrupt_data.get("mode", "scope_select"), session_id, interrupt_data.get("options", {}))
                         t = asyncio.create_task(_cleanup_hitl_timeout(session_id, _HITL_TIMEOUT))
                         _hitl_cleanup_tasks[session_id] = t
                         return
+
+            elif kind == "on_chain_end" and name == "report":
+                _current_node.pop(session_id, None)
+                await sse.put_done()
 
             elif kind == "on_chain_end" and name == "DeepResearch":
                 output = event.get("data", {}).get("output", {}) or {}
@@ -490,6 +510,7 @@ async def _resume_agent(sse: SSEManager, config: dict[str, Any], ctx: dict[str, 
                         "options": interrupt_data.get("options", {}),
                     }
                     hitl_triggered = True
+                    await sse.put_hitl(interrupt_data.get("mode", "scope_select"), session_id, interrupt_data.get("options", {}))
                     t = asyncio.create_task(_cleanup_hitl_timeout(session_id, _HITL_TIMEOUT))
                     _hitl_cleanup_tasks[session_id] = t
                     return

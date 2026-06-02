@@ -1,5 +1,5 @@
 export interface ChatMessage {
-  id: number
+  id: string
   role: 'user' | 'assistant' | 'hitl' | 'system'
   content: string
   created_at: string
@@ -20,7 +20,7 @@ export interface PatchEvent {
 }
 
 export interface HITLEvent {
-  mode: 'scope_select' | 'conflict_resolve' | 'direction_adjust'
+  mode: 'scope_select'
   session_id: string
   options: Record<string, unknown>
   ts: string

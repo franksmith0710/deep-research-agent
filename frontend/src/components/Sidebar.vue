@@ -15,30 +15,62 @@ async function createAndSelect() {
 
 <template>
   <aside class="sidebar">
-    <button class="new-btn" @click="createAndSelect()">+ 新建会话</button>
+    <div class="sidebar-header">
+      <div class="logo">Deep Search</div>
+      <button class="new-btn" @click="createAndSelect()">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2v12m-6-6h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        新建会话
+      </button>
+    </div>
     <SessionList />
   </aside>
 </template>
 
 <style scoped>
 .sidebar {
-  width: 280px;
-  min-width: 280px;
-  background: #f5f6f8;
-  color: #1a1a1a;
+  width: var(--sidebar-width);
+  min-width: var(--sidebar-width);
+  background: var(--color-surface);
+  color: var(--color-text-primary);
   display: flex;
   flex-direction: column;
-  padding: 12px;
+  border-right: 1px solid var(--color-sidebar-border);
+}
+.sidebar-header {
+  padding: 16px 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border-bottom: 1px solid var(--color-border-light);
+  margin-bottom: 4px;
+}
+.logo {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  letter-spacing: -0.3px;
+  padding: 0 4px;
 }
 .new-btn {
-  background: #1976d2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: var(--color-primary);
   color: white;
   border: none;
   padding: 10px 16px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   font-size: 14px;
-  margin-bottom: 12px;
+  font-weight: 500;
+  transition: background var(--transition-fast), transform var(--transition-fast);
 }
-.new-btn:hover { background: #e8eaee; }
+.new-btn:hover {
+  background: var(--color-primary-light);
+  transform: translateY(-1px);
+}
+.new-btn:active {
+  transform: translateY(0);
+}
 </style>

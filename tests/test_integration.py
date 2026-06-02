@@ -13,7 +13,7 @@ print("[PASS] config")
 
 # 2. models
 from src.models import Intent, SSEEvent, ResearchRequest
-assert len([e for e in Intent]) == 4
+assert len([e for e in Intent]) == 3
 print("[PASS] models")
 
 # 3. llm
@@ -51,27 +51,16 @@ rq = resolve_query("市场规模方面再说详细点", "已有调研")
 assert rq
 print(f"[PASS] planner: {rq[:30]}")
 
-# 9. page_brief
-from src.page_brief.brief import brief_from_page
-bp = brief_from_page("测试", "2025年AI Agent市场达100亿美元。主要应用客服领域。")
-assert len(bp["key_points"]) > 0
-print("[PASS] page_brief")
-
 # 10. ranker (原 11)
 from src.synthesize.ranker import rank_findings
 rf = rank_findings("AI", [{"topic": "市场", "content": "AI市场规模"}])
 assert len(rf) == 1
 print("[PASS] ranker")
 
-# 12. synthesizer (LLM)
-from src.synthesize.synthesizer import synthesize_section
-ss = synthesize_section([{"topic": "市场", "content": "2025年100亿美元", "source_url": "https://a.com"}], "市场规模")
-assert ss["section_title"] and ss["content"]
-print(f"[PASS] synthesizer")
-
 # 13. writer
+import asyncio
 from src.report.writer import generate_outline
-ol = generate_outline("AI Agent市场")
+ol = asyncio.run(generate_outline("AI Agent市场"))
 assert len(ol) == 7
 print(f"[PASS] writer (7 chapters)")
 
@@ -85,7 +74,7 @@ print(f"[PASS] credibility: {tag}")
 # 15. graph
 from src.agent.graph import build_graph
 g = build_graph()
-assert len(list(g.nodes.keys())) >= 19
+assert len(list(g.nodes.keys())) == 13
 print(f"[PASS] graph ({len(list(g.nodes.keys()))} nodes)")
 
 # 16. SSE
@@ -101,4 +90,4 @@ assert "/api/sessions" in routes
 print(f"[PASS] server ({len(routes)} routes)")
 
 close_pool()
-print("\n=== ALL 17 MODULES PASSED ===")
+print("\n=== ALL MODULES PASSED ==="")

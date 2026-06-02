@@ -57,6 +57,8 @@ export function researchSSE(
   let cursor = 0
   let lineBuf = ''
   let done = false
+  let receivedDoneEvent = false
+  let receivedHITLEvent = false
 
   xhr.onprogress = () => {
     const chunk = xhr.responseText.slice(cursor)
@@ -68,6 +70,8 @@ export function researchSSE(
     for (const line of parts) {
       if (line.startsWith('event: ')) {
         currentEvent = line.slice(7).trim()
+        if (currentEvent === 'done') receivedDoneEvent = true
+        if (currentEvent === 'hitl') receivedHITLEvent = true
       } else if (line.startsWith('data: ')) {
         const data = line.slice(6).trim()
         if (currentEvent && data) {
@@ -85,8 +89,12 @@ export function researchSSE(
   xhr.onloadend = () => {
     if (done) return
     done = true
-    if (xhr.status >= 200 && xhr.status < 300) {
+    if (xhr.status >= 200 && xhr.status < 300 && receivedDoneEvent) {
       onDone()
+    } else if (receivedHITLEvent) {
+      // 后端明确报告了 HITL 中断，等轮询恢复
+    } else if (xhr.status >= 200 && xhr.status < 300) {
+      onError('连接异常结束')
     } else {
       onError(`HTTP ${xhr.status}`)
     }
@@ -113,6 +121,7 @@ export function researchHITL_SSE(
   let cursor = 0
   let lineBuf = ''
   let done = false
+  let receivedHITLEvent = false
 
   xhr.onprogress = () => {
     const chunk = xhr.responseText.slice(cursor)
@@ -124,6 +133,7 @@ export function researchHITL_SSE(
     for (const line of parts) {
       if (line.startsWith('event: ')) {
         currentEvent = line.slice(7).trim()
+        if (currentEvent === 'hitl') receivedHITLEvent = true
       } else if (line.startsWith('data: ')) {
         const dataStr = line.slice(6).trim()
         if (currentEvent && dataStr) {
@@ -137,7 +147,8 @@ export function researchHITL_SSE(
   xhr.onloadend = () => {
     if (done) return
     done = true
-    if (xhr.status >= 200 && xhr.status < 300) onDone()
+    if (xhr.status >= 200 && xhr.status < 300 && !receivedHITLEvent) onDone()
+    else if (xhr.status >= 200 && xhr.status < 300) { /* HITL interrupt — status poll will pick it up */ }
     else onError(`HTTP ${xhr.status}`)
   }
 

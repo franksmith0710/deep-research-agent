@@ -1,16 +1,28 @@
 <script setup lang="ts">
-import { watch, ref } from 'vue'
+import { watch, ref, computed } from 'vue'
 import { useSessionStore } from '../stores/sessionStore'
 import { useChatStore } from '../stores/chatStore'
-import { fetchHistory, fetchStatus, cancelResearch } from '../api'
+import { fetchHistory, fetchStatus } from '../api'
 import ChatHistory from './ChatHistory.vue'
 import QueryInput from './QueryInput.vue'
+import WelcomeSuggestions from './WelcomeSuggestions.vue'
 import type { useHITL } from '../composables/useHITL'
 
 const props = defineProps<{ hitl: ReturnType<typeof useHITL> }>()
 const sessionStore = useSessionStore()
 const chatStore = useChatStore()
-const queryInputRef = ref<{ abort: () => void }>()
+const queryInputRef = ref<{ abort: () => void; sendText: (t: string) => void }>()
+
+const showWelcome = computed(() =>
+  !!sessionStore.currentSessionId &&
+  chatStore.messages.length === 0 &&
+  !chatStore.isStreaming &&
+  chatStore.runStatus !== 'running'
+)
+
+function handleSelect(text: string) {
+  queryInputRef.value?.sendText(text)
+}
 
 async function checkRunning(id: string) {
   try {
@@ -22,6 +34,7 @@ async function checkRunning(id: string) {
       chatStore.startStatusPoll(async () => {
         try {
           const st = await fetchStatus(id)
+          if (chatStore.runStatus === 'completed') return
           if (st.status === 'completed') {
             chatStore.stopStatusPoll()
             chatStore.runStatus = ''
@@ -33,7 +46,7 @@ async function checkRunning(id: string) {
             chatStore.currentStep = ''
             if (st.hitl) {
               props.hitl.restore({
-                mode: st.hitl.mode as 'scope_select' | 'conflict_resolve' | 'direction_adjust',
+                mode: st.hitl.mode as 'scope_select',
                 session_id: id,
                 options: st.hitl.options,
                 ts: new Date().toISOString(),
@@ -57,7 +70,6 @@ watch(() => sessionStore.currentSessionId, async (id, oldId) => {
   if (oldId) {
     queryInputRef.value?.abort()
     props.hitl.abort()
-    cancelResearch(oldId).catch(() => {})
   }
   chatStore.reset()
   await checkRunning(id)
@@ -66,7 +78,11 @@ watch(() => sessionStore.currentSessionId, async (id, oldId) => {
 
 <template>
   <main class="main-area">
-    <ChatHistory />
+    <WelcomeSuggestions
+      v-if="showWelcome"
+      :on-select="handleSelect"
+    />
+    <ChatHistory v-else />
     <QueryInput ref="queryInputRef" :restore="props.hitl.restore" />
   </main>
 </template>
@@ -76,8 +92,7 @@ watch(() => sessionStore.currentSessionId, async (id, oldId) => {
   flex: 1;
   display: flex;
   flex-direction: column;
-  background: #ffffff;
-  color: #e0e0e0;
+  background: var(--color-bg);
   overflow: hidden;
 }
 </style>

@@ -15,11 +15,17 @@ from openai import (
 
 from src.config import settings
 from src.logging_config import get_logger
+from src.utils.circuit_breaker import CircuitBreaker
 
 logger = get_logger("llm")
 
 _sync_client: ChatOpenAI | None = None
 _async_client: ChatOpenAI | None = None
+_llm_circuit_breaker = CircuitBreaker(
+    "llm",
+    failure_threshold=settings.cb_llm_failure_threshold,
+    recovery_timeout=settings.cb_llm_recovery_timeout,
+)
 
 
 async def chat_stream(
@@ -28,7 +34,9 @@ async def chat_stream(
     max_retries: int = 4,
     timeout: float = 60.0,
 ) -> AsyncGenerator[str, None]:
-    """流式调用 LLM，逐 token 产出。"""
+    """流式调用 LLM，逐 token 产出。含熔断保护。"""
+    _llm_circuit_breaker.check()
+
     client = await get_async_client()
     kwargs: dict[str, Any] = {
         "timeout": timeout,
@@ -47,6 +55,7 @@ async def chat_stream(
                     logger.debug(f"LLM stream token len={len(token)} latency={latency:.3f}s")
                     yield token
                     start_time = time.time()  # reset for next token timing
+            _llm_circuit_breaker.succeed()
             return
         except (RateLimitError, APIConnectionError, APITimeoutError) as e:
             last_error = e
@@ -65,6 +74,7 @@ async def chat_stream(
             last_error = e
             break
 
+    _llm_circuit_breaker.fail()
     logger.error(f"LLM stream failed after {max_retries} retries: {last_error}")
     raise RuntimeError(f"LLM 流式调用失败（{max_retries} 次重试后）: {last_error}")
 
@@ -105,46 +115,49 @@ def chat(
     max_retries: int = 4,
     timeout: float = 60.0,
 ) -> str:
-    """调用 DeepSeek Chat API，自动重试（最多 4 次）。"""
-    client = get_sync_client()
-    kwargs: dict[str, Any] = {
-        "timeout": timeout,
-    }
-    if response_format:
-        kwargs["response_format"] = response_format
+    """调用 DeepSeek Chat API，自动重试（最多 4 次）。含熔断保护。"""
+    def _do_chat() -> str:
+        client = get_sync_client()
+        kwargs: dict[str, Any] = {
+            "timeout": timeout,
+        }
+        if response_format:
+            kwargs["response_format"] = response_format
 
-    logger.debug(f"LLM call model={settings.deepseek_model} messages={len(messages)} timeout={timeout}")
+        logger.debug(f"LLM call model={settings.deepseek_model} messages={len(messages)} timeout={timeout}")
 
-    last_error: Exception | None = None
-    for attempt in range(max_retries):
-        start_time = time.time()
-        try:
-            resp = client.invoke(messages, **kwargs)
-            latency = time.time() - start_time
-            content = resp.content or ""
-            if content:
-                logger.debug(f"LLM response len={len(content)} latency={latency:.3f}s")
-                return content
-            raise RuntimeError("LLM 返回空响应")
-        except (RateLimitError, APIConnectionError, APITimeoutError) as e:
-            last_error = e
-            logger.warning(f"LLM retry {attempt + 1}/{max_retries} error={e}")
-            if attempt < max_retries - 1:
-                wait = min(2 ** attempt + 1, 10)
-                time.sleep(wait)
-        except APIError as e:
-            last_error = e
-            logger.warning(f"LLM retry {attempt + 1}/{max_retries} error={e}")
-            if attempt < max_retries - 1 and 500 <= e.status_code < 600:
-                time.sleep(min(2 ** attempt + 1, 10))
-            else:
+        last_error: Exception | None = None
+        for attempt in range(max_retries):
+            start_time = time.time()
+            try:
+                resp = client.invoke(messages, **kwargs)
+                latency = time.time() - start_time
+                content = resp.content or ""
+                if content:
+                    logger.debug(f"LLM response len={len(content)} latency={latency:.3f}s")
+                    return content
+                raise RuntimeError("LLM 返回空响应")
+            except (RateLimitError, APIConnectionError, APITimeoutError) as e:
+                last_error = e
+                logger.warning(f"LLM retry {attempt + 1}/{max_retries} error={e}")
+                if attempt < max_retries - 1:
+                    wait = min(2 ** attempt + 1, 10)
+                    time.sleep(wait)
+            except APIError as e:
+                last_error = e
+                logger.warning(f"LLM retry {attempt + 1}/{max_retries} error={e}")
+                if attempt < max_retries - 1 and 500 <= e.status_code < 600:
+                    time.sleep(min(2 ** attempt + 1, 10))
+                else:
+                    break
+            except Exception as e:
+                last_error = e
                 break
-        except Exception as e:
-            last_error = e
-            break
 
-    logger.error(f"LLM failed after {max_retries} retries: {last_error}")
-    raise RuntimeError(f"LLM 调用失败（{max_retries} 次重试后）: {last_error}")
+        logger.error(f"LLM failed after {max_retries} retries: {last_error}")
+        raise RuntimeError(f"LLM 调用失败（{max_retries} 次重试后）: {last_error}")
+
+    return _llm_circuit_breaker.call(_do_chat)
 
 
 def chat_json(
@@ -154,6 +167,80 @@ def chat_json(
 ) -> dict[str, Any]:
     """调用 LLM 并返回 JSON 对象。"""
     text = chat(
+        messages=messages,
+        response_format={"type": "json_object"},
+        max_retries=max_retries,
+        timeout=timeout,
+    )
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.warning(f"JSON parse failed, trying regex extraction: {e}")
+        import re
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        raise RuntimeError(f"LLM 输出非 JSON: {text[:200]}") from e
+
+
+async def chat_async(
+    messages: list[dict[str, str]],
+    response_format: dict | None = None,
+    max_retries: int = 4,
+    timeout: float = 60.0,
+) -> str:
+    """异步调用 DeepSeek Chat API，自动重试。含熔断保护。"""
+    async def _do_chat_async() -> str:
+        client = await get_async_client()
+        kwargs: dict[str, Any] = {
+            "timeout": timeout,
+        }
+        if response_format:
+            kwargs["response_format"] = response_format
+
+        logger.debug(f"LLM async call model={settings.deepseek_model} messages={len(messages)} timeout={timeout}")
+
+        last_error: Exception | None = None
+        for attempt in range(max_retries):
+            start_time = time.time()
+            try:
+                resp = await client.ainvoke(messages, **kwargs)
+                latency = time.time() - start_time
+                content = resp.content or ""
+                if content:
+                    logger.debug(f"LLM async response len={len(content)} latency={latency:.3f}s")
+                    return content
+                raise RuntimeError("LLM 返回空响应")
+            except (RateLimitError, APIConnectionError, APITimeoutError) as e:
+                last_error = e
+                logger.warning(f"LLM async retry {attempt + 1}/{max_retries} error={e}")
+                if attempt < max_retries - 1:
+                    wait = min(2 ** attempt + 1, 10)
+                    await asyncio.sleep(wait)
+            except APIError as e:
+                last_error = e
+                logger.warning(f"LLM async retry {attempt + 1}/{max_retries} error={e}")
+                if attempt < max_retries - 1 and 500 <= e.status_code < 600:
+                    await asyncio.sleep(min(2 ** attempt + 1, 10))
+                else:
+                    break
+            except Exception as e:
+                last_error = e
+                break
+
+        logger.error(f"LLM async failed after {max_retries} retries: {last_error}")
+        raise RuntimeError(f"LLM 异步调用失败（{max_retries} 次重试后）: {last_error}")
+
+    return await _llm_circuit_breaker.call_async(_do_chat_async)
+
+
+async def chat_json_async(
+    messages: list[dict[str, str]],
+    max_retries: int = 4,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """异步调用 LLM 并返回 JSON 对象。"""
+    text = await chat_async(
         messages=messages,
         response_format={"type": "json_object"},
         max_retries=max_retries,

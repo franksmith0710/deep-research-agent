@@ -7,7 +7,6 @@ const sessionStore = useSessionStore()
 
 <template>
   <div class="session-list">
-    <div class="list-header">历史会话</div>
     <div v-for="s in sessionStore.sessions" :key="s.session_id">
       <SessionItem :session="s" />
     </div>
@@ -16,7 +15,6 @@ const sessionStore = useSessionStore()
 </template>
 
 <style scoped>
-.session-list { flex: 1; overflow-y: auto; }
-.list-header { font-size: 12px; color: #999; padding: 8px 4px; }
-.empty { color: #999; font-size: 13px; padding: 16px; text-align: center; }
+.session-list { flex: 1; overflow-y: auto; padding: 4px 0; }
+.empty { color: var(--color-text-muted); font-size: 13px; padding: 24px 16px; text-align: center; }
 </style>

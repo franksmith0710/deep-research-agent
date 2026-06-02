@@ -22,11 +22,11 @@ class Settings(BaseSettings):
     memory_retrieval_limit: int = 3
     memory_min_score: float = 0.7
 
-    fs_global_topk: int = 10
-    fs_search_limit: int = 3
-    fs_convergence_rounds: int = 3
-    fs_update_threshold_high: float = 0.88
-    fs_update_threshold_low: float = 0.6
+    # Circuit breaker
+    cb_llm_failure_threshold: int = 3
+    cb_llm_recovery_timeout: int = 30
+    cb_scraper_failure_threshold: int = 5
+    cb_scraper_recovery_timeout: int = 60
 
     log_level: str = "DEBUG"
 

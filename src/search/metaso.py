@@ -18,8 +18,11 @@ class MetasoSearch(SearchEngine):
 
     def search(self, query: str, num_results: int = 5) -> list[SearchResultItem]:
         body = {"question": query, "lang": "zh", "stream": False}
-        resp = self._client.post("/search/v2", json=body)
-        resp.raise_for_status()
+        try:
+            resp = self._client.post("/search/v2", json=body)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(f"Metaso API [{e.response.status_code}]: {e.response.text[:200]}") from e
         data = resp.json().get("data", {})
         refs = data.get("references", [])
         items = []

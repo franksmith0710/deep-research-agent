@@ -82,6 +82,21 @@ def get_chat_history(session_id: str, limit: int = 100) -> list[dict[str, Any]]:
 
 # ── research_tasks ────────────────────────────────────────────────────
 
+def create_session_idle(session_id: str) -> None:
+    with _pool.getconn() as conn:
+        try:
+            with conn.cursor() as cur:
+                now = datetime.now(timezone.utc)
+                cur.execute(
+                    """INSERT INTO research_tasks (session_id, query, status, created_at, updated_at)
+                       VALUES (%s, '', 'pending', %s, %s)""",
+                    (session_id, now, now),
+                )
+                conn.commit()
+        finally:
+            _pool.putconn(conn)
+
+
 def create_task(session_id: str, query: str) -> int:
     with _pool.getconn() as conn:
         try:
@@ -186,13 +201,16 @@ def get_all_sessions() -> list[dict[str, Any]]:
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """SELECT DISTINCT ON (rt.session_id)
-                           rt.session_id,
-                           rt.query AS query_preview,
-                           rt.status,
-                           rt.updated_at
-                       FROM research_tasks rt
-                       ORDER BY rt.session_id, rt.updated_at DESC"""
+                    """SELECT * FROM (
+                           SELECT DISTINCT ON (rt.session_id)
+                               rt.session_id,
+                               rt.query AS query_preview,
+                               rt.status,
+                               rt.updated_at
+                           FROM research_tasks rt
+                           ORDER BY rt.session_id, rt.updated_at DESC
+                       ) sub
+                       ORDER BY sub.updated_at DESC"""
                 )
                 return cur.fetchall()
         finally:
@@ -211,11 +229,6 @@ def delete_session_data(session_id: str) -> None:
                 cur.execute(
                     "DELETE FROM research_tasks WHERE session_id = %s",
                     (session_id,),
-                )
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM fs_nodes WHERE context_type = 'session' AND uri LIKE %s",
-                    (f"viking://session/{session_id}/%",),
                 )
             conn.commit()
         finally:

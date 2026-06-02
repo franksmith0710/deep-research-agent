@@ -29,26 +29,6 @@ def _merge_sections(
     return result
 
 
-def _merge_pages(
-    old: list[dict], new: list[dict]
-) -> list[dict]:
-    """scraped_pages 合并 reducer：按 URL 去重追加。"""
-    seen = set()
-    for p in old:
-        u = p.get("url", "")
-        if u:
-            seen.add(u)
-    result = list(old)
-    for p in new:
-        u = p.get("url", "")
-        if u and u not in seen:
-            seen.add(u)
-            result.append(p)
-        elif not u:
-            result.append(p)
-    return result
-
-
 class AgentState(TypedDict):
     """LangGraph Agent 全局状态。"""
     
@@ -58,7 +38,7 @@ class AgentState(TypedDict):
     # 输入
     query: str
     resolved_query: str
-    intent: str  # deep_research / refine_section / new_search_topic / simple_llm
+    intent: str  # deep_research / refine_section / simple_llm
     
     # 对话历史
     messages: Annotated[list[dict[str, str]], add_messages]
@@ -70,7 +50,7 @@ class AgentState(TypedDict):
     
     # 搜索结果
     search_results: list[dict[str, Any]]
-    scraped_pages: Annotated[list[dict[str, Any]], _merge_pages]
+    scraped_pages: list[dict[str, Any]]
     page_summaries: list[dict[str, Any]]  # 逐页简报列表（含 key_points_json + page_abstract）
     
     # 发现
@@ -88,13 +68,13 @@ class AgentState(TypedDict):
     
     # HITL 条件标记
     need_scope: bool
-    need_adjust: bool
-    has_conflict: bool
-    conflict_description: str
+    user_supplement: str  # HITL 用户自由输入的内容
     coverage_score: int
     
     # 搜索 Fallback 标记
     search_all_failed: bool
+    _searched_queries: list[str]  # search_node 已搜过的 query，回环时跳过
+    _findings_embeddings: list[list[float]]  # dedup_rerank 缓存嵌入
     _llm_fallback: bool
     _report_streamed: bool
 
@@ -125,11 +105,11 @@ def make_initial_state(
         "assess_round": 0,
         "refine_section_name": "",
         "need_scope": False,
-        "need_adjust": False,
-        "has_conflict": False,
-        "conflict_description": "",
+        "user_supplement": "",
         "coverage_score": 0,
         "search_all_failed": False,
+        "_searched_queries": [],
+        "_findings_embeddings": [],
         "_llm_fallback": False,
         "_report_streamed": False,
     }

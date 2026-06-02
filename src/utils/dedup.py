@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-SEMANTIC_DUP_THRESHOLD = 0.88
+SEMANTIC_DUP_THRESHOLD = 0.8
 
 
 def max_cosine_similarity(

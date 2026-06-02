@@ -54,17 +54,22 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   function finalizeStream() {
-    if (!streamingText.value) return
-    messages.value.push({
-      id: Date.now(),
-      role: 'assistant',
-      content: streamingText.value,
-      created_at: new Date().toISOString(),
-    })
+    stopStatusPoll()
+    runStatus.value = 'completed'
+    currentEvent.value = null
+    currentStep.value = ''
+
+    if (streamingText.value) {
+      messages.value.push({
+        id: 'local_' + Date.now(),
+        role: 'assistant',
+        content: streamingText.value,
+        created_at: new Date().toISOString(),
+      })
+    }
     streamingText.value = ''
     isStreaming.value = false
     allEvents.value = []
-    currentStep.value = ''
   }
 
   function clearPending() {

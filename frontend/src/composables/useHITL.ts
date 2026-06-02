@@ -31,6 +31,7 @@ export function useHITL() {
     submitting = true
     try {
       const chatStore = useChatStore()
+      let receivedHITLEvent = false
       currentSource = researchHITL_SSE(
         hitl.session_id,
         hitl.mode,
@@ -45,12 +46,16 @@ export function useHITL() {
             case 'text':
               chatStore.appendStream((d.content as string) || '')
               break
+            case 'hitl':
+              receivedHITLEvent = true
+              break
           }
         },
         (err) => {
           chatStore.addChainEvent({ type: 'action_result', node: 'error', content: err, ts: '' })
         },
         () => {
+          if (receivedHITLEvent) return
           chatStore.finalizeStream()
           chatStore.runStatus = 'completed'
         },

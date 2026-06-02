@@ -20,7 +20,7 @@ def rank_findings(
     texts = [f"{f.get('topic', '')}: {f.get('content', '')}" for f in findings]
     scored = rerank(query, texts, top_k=top_k)
     # 关联回原数据
-    score_map = {texts[i]: scored[i][1] for i in range(len(scored))}
+    score_map = dict(scored)
     result = []
     for f in findings:
         text = f"{f.get('topic', '')}: {f.get('content', '')}"

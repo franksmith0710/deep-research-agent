@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field
 class Intent(str, Enum):
     deep_research = "deep_research"
     refine_section = "refine_section"
-    new_search_topic = "new_search_topic"
     simple_llm = "simple_llm"
 
 
@@ -33,8 +32,6 @@ class ChainType(str, Enum):
 
 class HITLMode(str, Enum):
     scope_select = "scope_select"
-    conflict_resolve = "conflict_resolve"
-    direction_adjust = "direction_adjust"
 
 
 class ContextType(str, Enum):
@@ -95,8 +92,6 @@ class HITLRequest(BaseModel):
 
 class HITLStatus(BaseModel):
     need_scope: bool = False
-    need_adjust: bool = False
-    has_conflict: bool = False
 
 
 # ── 搜索 / 抓取 ───────────────────────────────────────────────────────

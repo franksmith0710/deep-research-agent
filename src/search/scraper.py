@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import re
 import time
-from urllib.parse import urlparse
-
 import httpx
 import trafilatura
 from trafilatura.settings import use_config
 
 from src.models import ScrapedPage
+from src.config import settings
 from src.logging_config import get_logger
+from src.utils.circuit_breaker import CircuitBreaker, CircuitBreakerError
 
 logger = get_logger("scraper")
 
@@ -73,23 +73,36 @@ def _extract_fallback(html: str, title: str) -> str:
 
 
 class Scraper:
-    """用 httpx + trafilatura 提取网页正文，含重试、超时、降级。"""
+    """用 httpx + trafilatura 提取网页正文，含重试、超时、降级。复用持久化 httpx.Client 以利用连接池。"""
 
     def __init__(self, timeout: float = 20.0) -> None:
         self._timeout = timeout
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT),
+            follow_redirects=True,
+            headers={"User-Agent": _USER_AGENT},
+        )
+        self._circuit_breaker = CircuitBreaker(
+            "scraper",
+            failure_threshold=settings.cb_scraper_failure_threshold,
+            recovery_timeout=settings.cb_scraper_recovery_timeout,
+        )
 
     def _fetch(self, url: str) -> tuple[str, str, str]:
-        """获取页面 HTML，返回 (html, final_url, error)。"""
+        """获取页面 HTML，返回 (html, final_url, error)。含熔断保护。"""
+        try:
+            self._circuit_breaker.check()
+        except CircuitBreakerError:
+            logger.warning(f"Scraper circuit breaker is open, skipping url={url}")
+            return "", "", "scraper circuit breaker open"
+
         last_error = ""
         for attempt in range(_MAX_RETRIES):
             try:
-                with httpx.Client(
-                    timeout=httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT),
-                    follow_redirects=True,
-                ) as client:
-                    resp = client.get(url, headers={"User-Agent": _USER_AGENT})
-                    resp.raise_for_status()
-                    return resp.text, str(resp.url), ""
+                resp = self._client.get(url)
+                resp.raise_for_status()
+                self._circuit_breaker.succeed()
+                return resp.text, str(resp.url), ""
             except httpx.TimeoutException as e:
                 last_error = f"超时: {e}"
                 logger.warning(f"第 {attempt + 1} 次超时 url={url}")
@@ -107,6 +120,7 @@ class Scraper:
                 logger.debug(f"等待 {delay}s 后重试 url={url}")
                 time.sleep(delay)
 
+        self._circuit_breaker.fail()
         return "", "", last_error
 
     def scrape(self, url: str) -> ScrapedPage:
@@ -166,4 +180,4 @@ class Scraper:
         return results
 
     def close(self) -> None:
-        pass
+        self._client.close()

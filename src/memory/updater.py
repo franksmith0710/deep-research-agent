@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from src.fs import filesystem as fs
 from src.utils.dedup import SEMANTIC_DUP_THRESHOLD
 from src.fs.uri import VikingURI
 from src.local_models.embedder import embed_text
-from src.llm.client import chat_json
+from src.llm.client import chat_json_async
 from src.logging_config import get_logger
 
 logger = get_logger("memory_updater")
@@ -25,17 +26,19 @@ _EXTRACT_PROMPT = """你是一个记忆提取专家。从以下完整研究报�
 2. 每条知识标注所属分类：
    - entities：实体知识（人物/公司/产品/概念/技术）
    - patterns：可复用结论/模式/最佳实践
-3. 保留原文中的数字、日期、人名等关键信息
-4. 每条知识附带原文中提及的来源 URL（如果有）
-5. 只写事实，不添加评价或推测
-6. 不要提取时效性信息（新闻、股价、天气等）
+3. 每条知识附带 2-5 个标签 tags，覆盖不同领域维度
+   例如 ["量子计算", "纠错码"]、["深度学习", "Transformer"]、["生物医药", "基因编辑"]
+4. 保留原文中的数字、日期、人名等关键信息
+5. 每条知识附带原文中提及的来源 URL（如果有）
+6. 只写事实，不添加评价或推测
+7. 不要提取时效性信息：新闻快讯、股价行情、天气预报、游戏版本攻略、体育赛事结果、短期政策解读、产品发布公告等具有明确时间窗口的内容
 
 返回 JSON：
 {{
     "knowledge": [
         {{
             "category": "entities|patterns",
-            "name": "实体或模式名称，如 surface_code",
+            "name": "实体或模式名称，如 surface_code、transformers架构、CRISPR基因编辑",
             "content": "结构化知识正文",
             "source_urls": ["https://..."],
             "tags": ["量子计算", "纠错码"]
@@ -45,8 +48,8 @@ _EXTRACT_PROMPT = """你是一个记忆提取专家。从以下完整研究报�
 """
 
 
-def extract_knowledge(report: str) -> list[dict[str, Any]]:
-    """LLM 从报告中提取可复用知识（分块提取 + 去重）。"""
+async def extract_knowledge(report: str) -> list[dict[str, Any]]:
+    """LLM 从报告中提取可复用知识（并行分块提取 + 去重）。"""
     if not report or len(report.strip()) < 100:
         return []
 
@@ -54,19 +57,31 @@ def extract_knowledge(report: str) -> list[dict[str, Any]]:
     MAX_CHUNKS = 3
     chunks = [report[i:i+CHUNK_SIZE] for i in range(0, len(report), CHUNK_SIZE)][:MAX_CHUNKS]
 
-    seen_names = set()
-    all_knowledge = []
-    for chunk in chunks:
-        result = chat_json([
+    async def _extract_chunk(chunk: str) -> list[dict[str, Any]]:
+        result = await chat_json_async([
             {"role": "system", "content": "你是记忆提取专家。请用 JSON 格式回答。"},
             {"role": "user", "content": _EXTRACT_PROMPT.format(report=chunk)},
         ])
-        for item in result.get("knowledge", []):
+        return result.get("knowledge", [])
+
+    results = await asyncio.gather(*[_extract_chunk(c) for c in chunks])
+
+    seen_names = set()
+    all_knowledge = []
+    for items in results:
+        for item in items:
             name = item.get("name", "").strip().lower().replace(" ", "_").replace("/", "_")
             if name and name not in seen_names:
                 seen_names.add(name)
                 all_knowledge.append(item)
     return all_knowledge[:5]
+
+
+def _names_overlap(a: str, b: str) -> bool:
+    """检查两个 name 是否有字面重叠。无 name 时保守允许合并。"""
+    if not a or not b:
+        return True
+    return a in b or b in a
 
 
 def _search_similar(content: str, category: str, limit: int = 3) -> list[dict[str, Any]]:
@@ -77,13 +92,13 @@ def _search_similar(content: str, category: str, limit: int = 3) -> list[dict[st
     return results
 
 
-def update_memory(
+async def update_memory(
     session_id: str,
     task_id: int,
     report: str,
 ) -> None:
     """两阶段记忆更新：从报告提取知识 → 双阈值去重写入。"""
-    knowledge = extract_knowledge(report)
+    knowledge = await extract_knowledge(report)
     if not knowledge:
         logger.info("memory_updater: 无可提取的知识")
         return
@@ -108,6 +123,13 @@ def update_memory(
         best = similar[0]
         best_score = best.get("_score", best.get("similarity", 0.0)) or 0.0
         best_uri = best.get("uri", "")
+        best_name = best.get("name", "").strip().lower().replace(" ", "_").replace("/", "_")
+
+        # 主题名无字面重叠 → 跨主题误匹配，降级为 ADD
+        if not _names_overlap(name, best_name):
+            _do_add(session_id, task_id, content, name, category, source_url)
+            logger.debug(f"ADD (topic_mismatch) existing={best_name} new={name} score={best_score:.3f}")
+            continue
 
         if best_score >= SEMANTIC_DUP_THRESHOLD:
             # UPDATE: 直接覆盖
